@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "PlumePack V3 Clone - Premiere Pro Project Consolidation Tool"
 authors = ["Neofox Media"]
 edition = "2021"
+default-run = "plumepack-clone"
 
 [lib]
 name = "plumepack_clone_lib"
