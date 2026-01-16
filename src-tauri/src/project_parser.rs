@@ -182,6 +182,10 @@ struct ParserState {
     current_text: String,
     /// Object references: source_id -> Vec<(ref_type, target_id)>
     object_refs: HashMap<String, Vec<(String, String)>>,
+    /// Track unique attribute names for debugging
+    unique_attrs: std::collections::HashSet<String>,
+    /// Track element tags that have ID-like attributes
+    elements_with_refs: Vec<(String, String, String)>, // (element_tag, attr_name, attr_value)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -253,6 +257,8 @@ impl ProjectParser {
             current_object_id: None,
             current_text: String::new(),
             object_refs: HashMap::new(),
+            unique_attrs: std::collections::HashSet::new(),
+            elements_with_refs: Vec::new(),
         };
 
         // Separate storage for file paths found anywhere in the XML
@@ -267,42 +273,82 @@ impl ProjectParser {
                     state.current_element.push(tag_name.clone());
 
                     let mut object_ref_target: Option<String> = None;
+                    let mut this_element_object_id: Option<String> = None;
 
-                    // Extract ObjectID and ObjectRef if present
-                    for attr in e.attributes().flatten() {
-                        let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                        let value = String::from_utf8_lossy(&attr.value).to_string();
+                    // Collect all attributes first
+                    let attrs: Vec<(String, String)> = e.attributes()
+                        .flatten()
+                        .map(|attr| {
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let value = String::from_utf8_lossy(&attr.value).to_string();
+                            (key, value)
+                        })
+                        .collect();
 
+                    // Track ALL unique attribute names
+                    for (key, _) in &attrs {
+                        state.unique_attrs.insert(key.clone());
+                    }
+
+                    // Log attributes that look like references (contain ID, Ref, UID, etc.)
+                    for (key, value) in &attrs {
+                        let key_lower = key.to_lowercase();
+                        if (key_lower.contains("id") || key_lower.contains("ref") || key_lower.contains("uid"))
+                            && key != "ObjectID"
+                            && !value.is_empty()
+                        {
+                            // Only log a sample (first 100)
+                            if state.elements_with_refs.len() < 100 {
+                                state.elements_with_refs.push((tag_name.clone(), key.clone(), value.clone()));
+                            }
+                        }
+                    }
+
+                    // Debug: Log attributes for clip-related elements
+                    if tag_name.contains("Clip") || tag_name.contains("Track") || tag_name.contains("Source") || tag_name.contains("Media") {
+                        let attr_summary: Vec<String> = attrs.iter().map(|(k, v)| format!("{}={}", k, &v[..v.len().min(30)])).collect();
+                        if !attr_summary.is_empty() {
+                            tracing::debug!("Element <{}> attrs: {:?}", tag_name, attr_summary);
+                        }
+                    }
+
+                    // Extract ObjectID and ObjectRef/ObjectURef
+                    for (key, value) in &attrs {
                         if key == "ObjectID" {
+                            this_element_object_id = Some(value.clone());
                             state.current_object_id = Some(value.clone());
 
                             let mut obj = XmlObject::default();
                             obj.tag = tag_name.clone();
 
                             // Store all attributes
-                            for attr2 in e.attributes().flatten() {
-                                let k = String::from_utf8_lossy(attr2.key.as_ref()).to_string();
-                                let v = String::from_utf8_lossy(&attr2.value).to_string();
-                                obj.attributes.insert(k, v);
+                            for (k, v) in &attrs {
+                                obj.attributes.insert(k.clone(), v.clone());
                             }
 
-                            state.objects.insert(value, obj);
+                            state.objects.insert(value.clone(), obj);
                         } else if key == "ObjectRef" || key == "ObjectURef" {
                             // This element references another object
-                            object_ref_target = Some(value);
+                            object_ref_target = Some(value.clone());
+                            tracing::debug!("Found {} reference: {} -> {} in element {}", key,
+                                state.current_object_id.as_deref().unwrap_or("none"), value, tag_name);
                         }
                     }
 
-                    // If this element is a reference to another object, store the relationship
-                    if let (Some(ref parent_id), Some(ref target_id)) = (&state.current_object_id, &object_ref_target) {
-                        state.object_refs
-                            .entry(parent_id.clone())
-                            .or_default()
-                            .push((tag_name.clone(), target_id.clone()));
+                    // If this element has an ObjectRef, associate it with the current parent
+                    // The parent is the most recent ObjectID we've seen (could be this element or an ancestor)
+                    if let Some(ref target_id) = object_ref_target {
+                        let parent_id = state.current_object_id.clone().unwrap_or_default();
+                        if !parent_id.is_empty() {
+                            state.object_refs
+                                .entry(parent_id.clone())
+                                .or_default()
+                                .push((tag_name.clone(), target_id.clone()));
 
-                        // Also store in the object's refs
-                        if let Some(obj) = state.objects.get_mut(parent_id) {
-                            obj.refs.push((tag_name.clone(), target_id.clone()));
+                            // Also store in the object's refs
+                            if let Some(obj) = state.objects.get_mut(&parent_id) {
+                                obj.refs.push((tag_name.clone(), target_id.clone()));
+                            }
                         }
                     }
 
@@ -320,6 +366,53 @@ impl ProjectParser {
                 Ok(Event::End(_)) => {
                     state.current_element.pop();
                     state.current_text.clear();
+                }
+                Ok(Event::Empty(e)) => {
+                    // Handle self-closing tags like <Source ObjectRef="123"/>
+                    let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+
+                    // Collect all attributes
+                    let attrs: Vec<(String, String)> = e.attributes()
+                        .flatten()
+                        .map(|attr| {
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let value = String::from_utf8_lossy(&attr.value).to_string();
+                            (key, value)
+                        })
+                        .collect();
+
+                    // Debug: Log attributes for clip-related elements
+                    if tag_name.contains("Clip") || tag_name.contains("Track") || tag_name.contains("Source") || tag_name.contains("Media") {
+                        let attr_summary: Vec<String> = attrs.iter().map(|(k, v)| format!("{}={}", k, &v[..v.len().min(30)])).collect();
+                        if !attr_summary.is_empty() {
+                            tracing::debug!("Empty element <{}/> attrs: {:?}", tag_name, attr_summary);
+                        }
+                    }
+
+                    // Process ObjectID and ObjectRef
+                    for (key, value) in &attrs {
+                        if key == "ObjectID" {
+                            let mut obj = XmlObject::default();
+                            obj.tag = tag_name.clone();
+                            for (k, v) in &attrs {
+                                obj.attributes.insert(k.clone(), v.clone());
+                            }
+                            state.objects.insert(value.clone(), obj);
+                        } else if key == "ObjectRef" || key == "ObjectURef" {
+                            // This element references another object - associate with current parent
+                            if let Some(ref parent_id) = state.current_object_id {
+                                tracing::debug!("Found {} (empty): {} -> {} in element {}", key, parent_id, value, tag_name);
+                                state.object_refs
+                                    .entry(parent_id.clone())
+                                    .or_default()
+                                    .push((tag_name.clone(), value.clone()));
+
+                                if let Some(obj) = state.objects.get_mut(parent_id) {
+                                    obj.refs.push((tag_name.clone(), value.clone()));
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(Event::Text(e)) => {
                     state.current_text = e.unescape().unwrap_or_default().to_string();
@@ -378,6 +471,31 @@ impl ProjectParser {
                             }
                         }
                     }
+
+                    // Check if this looks like an object ID reference (pure numeric content in specific element names)
+                    // Premiere uses elements like <Source>, <ClipID>, <SourceID>, <MediaID> with numeric IDs
+                    let current_tag_lower = current_tag.to_lowercase();
+                    let text_trimmed = text.trim();
+                    let is_pure_numeric = !text_trimmed.is_empty() && text_trimmed.chars().all(|c| c.is_ascii_digit());
+                    let is_ref_element = current_tag_lower.contains("source")
+                        || current_tag_lower.contains("clip")
+                        || current_tag_lower.contains("media")
+                        || current_tag_lower.contains("ref")
+                        || current_tag_lower.contains("id");
+
+                    if is_pure_numeric && is_ref_element && text_trimmed.len() >= 1 {
+                        if let Some(ref parent_id) = state.current_object_id {
+                            // Store this as a text-based reference
+                            state.object_refs
+                                .entry(parent_id.clone())
+                                .or_default()
+                                .push((current_tag.to_string(), text_trimmed.to_string()));
+
+                            if let Some(obj) = state.objects.get_mut(parent_id) {
+                                obj.refs.push((current_tag.to_string(), text_trimmed.to_string()));
+                            }
+                        }
+                    }
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => {
@@ -390,6 +508,23 @@ impl ProjectParser {
         }
 
         tracing::info!("Found {} direct file paths in XML", file_paths.len());
+
+        // Log all unique attribute names that contain "id" or "ref"
+        let ref_related_attrs: Vec<&String> = state.unique_attrs.iter()
+            .filter(|a| {
+                let lower = a.to_lowercase();
+                lower.contains("id") || lower.contains("ref") || lower.contains("uid")
+            })
+            .collect();
+        tracing::info!("All ID/Ref-related attribute names found: {:?}", ref_related_attrs);
+
+        // Log sample of elements with reference-like attributes
+        if !state.elements_with_refs.is_empty() {
+            tracing::info!("Sample of reference-like attributes:");
+            for (tag, attr_name, attr_value) in state.elements_with_refs.iter().take(20) {
+                tracing::info!("  <{}> {}=\"{}\"", tag, attr_name, &attr_value[..attr_value.len().min(50)]);
+            }
+        }
 
         // Create media files from the file paths we found
         for (parent_id, file_path) in &file_paths {
@@ -439,9 +574,35 @@ impl ProjectParser {
         // First, collect all clip track items and their media references
         let mut clip_to_media: HashMap<String, String> = HashMap::new();
 
+        // Count clip track items for debugging
+        let clip_items: Vec<_> = objects.iter()
+            .filter(|(_, obj)| obj.tag == "VideoClipTrackItem" || obj.tag == "AudioClipTrackItem")
+            .collect();
+        tracing::info!("Found {} clip track items to process", clip_items.len());
+
+        // Log refs count
+        let total_refs: usize = object_refs.values().map(|v| v.len()).sum();
+        tracing::info!("Total references tracked: {}", total_refs);
+
+        // Log sample of object refs
+        if total_refs > 0 {
+            tracing::info!("Sample refs (first 10):");
+            for (parent_id, refs) in object_refs.iter().take(10) {
+                for (ref_type, target_id) in refs.iter().take(3) {
+                    if let Some(parent_obj) = objects.get(parent_id) {
+                        tracing::info!("  {} ({}) --{}-> {}", parent_id, parent_obj.tag, ref_type, target_id);
+                    }
+                }
+            }
+        }
+
         // Find VideoClipTrackItem and AudioClipTrackItem, trace their media references
         for (id, obj) in objects {
             if obj.tag == "VideoClipTrackItem" || obj.tag == "AudioClipTrackItem" {
+                // Log refs for this clip
+                if let Some(refs) = object_refs.get(id) {
+                    tracing::debug!("Clip {} has {} refs: {:?}", id, refs.len(), refs.iter().take(5).collect::<Vec<_>>());
+                }
                 // Follow references to find the actual media
                 if let Some(media_id) = self.find_media_reference(id, objects, object_refs, 0) {
                     clip_to_media.insert(id.clone(), media_id);
@@ -496,6 +657,7 @@ impl ProjectParser {
     }
 
     /// Follow ObjectRef chain to find the actual media file
+    /// Returns the ObjectID of the media source
     fn find_media_reference(
         &self,
         start_id: &str,
@@ -503,34 +665,40 @@ impl ProjectParser {
         object_refs: &HashMap<String, Vec<(String, String)>>,
         depth: usize,
     ) -> Option<String> {
-        if depth > 10 {
+        if depth > 15 {
             return None; // Prevent infinite loops
         }
 
         // Check if this object has references
         if let Some(refs) = object_refs.get(start_id) {
             for (ref_type, target_id) in refs {
-                // Check if target is a media file (has a file path associated)
+                // Log the reference chain for debugging
+                if depth < 3 {
+                    tracing::debug!("Ref chain depth {}: {} --({})-> {}", depth, start_id, ref_type, target_id);
+                }
+
+                // Check if target object exists
                 if let Some(target_obj) = objects.get(target_id) {
-                    // VideoMediaSource and AudioMediaSource are media containers
-                    if target_obj.tag == "VideoMediaSource" || target_obj.tag == "AudioMediaSource" {
+                    // These tags are media containers
+                    let tag = target_obj.tag.as_str();
+                    if tag == "VideoMediaSource" || tag == "AudioMediaSource"
+                        || tag == "VideoStream" || tag == "AudioStream"
+                        || tag == "Media" || tag.ends_with("MediaSource")
+                    {
                         return Some(target_id.clone());
                     }
 
-                    // VideoClip and AudioClip might reference media
-                    if target_obj.tag == "VideoClip" || target_obj.tag == "AudioClip" {
-                        // Recursively search from the clip
-                        if let Some(media_id) = self.find_media_reference(target_id, objects, object_refs, depth + 1) {
-                            return Some(media_id);
-                        }
+                    // Continue following the chain for any object type
+                    if let Some(media_id) = self.find_media_reference(target_id, objects, object_refs, depth + 1) {
+                        return Some(media_id);
                     }
-
-                    // VideoStream and AudioStream might be the actual media
-                    if target_obj.tag == "VideoStream" || target_obj.tag == "AudioStream" {
+                } else {
+                    // Target object not in our map - it might be a media file we captured directly
+                    // Just return the target_id and let the caller check if it's in media_files
+                    if depth > 0 {
                         return Some(target_id.clone());
                     }
-
-                    // Continue following the chain for other types
+                    // Try to follow this ID anyway
                     if let Some(media_id) = self.find_media_reference(target_id, objects, object_refs, depth + 1) {
                         return Some(media_id);
                     }

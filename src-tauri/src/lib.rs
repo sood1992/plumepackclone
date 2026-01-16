@@ -6,12 +6,17 @@ mod consolidation;
 mod commands;
 
 use commands::AppState;
-use tracing_subscriber;
+use tracing_subscriber::EnvFilter;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize logging
-    tracing_subscriber::fmt::init();
+    // Initialize logging with debug level for our crate
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("plumepack_clone_lib=debug,info"))
+        )
+        .init();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
