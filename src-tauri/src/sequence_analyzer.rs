@@ -166,8 +166,18 @@ impl<'a> SequenceAnalyzer<'a> {
 
         let sequence = match self.project.sequences.iter().find(|s| s.object_id == sequence_id) {
             Some(s) => s,
-            None => return,
+            None => {
+                tracing::warn!("SequenceAnalyzer: Could not find sequence with id '{}'", sequence_id);
+                return;
+            }
         };
+
+        let video_clip_count: usize = sequence.video_tracks.iter().map(|t| t.clips.len()).sum();
+        let audio_clip_count: usize = sequence.audio_tracks.iter().map(|t| t.clips.len()).sum();
+        tracing::info!("Analyzing sequence '{}' ({}): {} video tracks ({} clips), {} audio tracks ({} clips)",
+            sequence.name, sequence_id,
+            sequence.video_tracks.len(), video_clip_count,
+            sequence.audio_tracks.len(), audio_clip_count);
 
         // Analyze video tracks
         for track in &sequence.video_tracks {

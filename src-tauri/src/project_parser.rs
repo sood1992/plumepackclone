@@ -826,7 +826,9 @@ impl ProjectParser {
 
         // Get refs from this sequence (by UID)
         if let Some(seq_refs) = state.refs_from_uid.get(sequence_uid) {
+            tracing::debug!("Sequence '{}' has {} refs by UID", sequence.name, seq_refs.len());
             for (ref_tag, target, is_guid) in seq_refs {
+                tracing::debug!("  Ref: {} -> {} (guid: {})", ref_tag, target, is_guid);
                 // Look for VideoTracks and AudioTracks references
                 if ref_tag == "VideoTracks" || ref_tag == "AudioTracks" {
                     let is_video = ref_tag == "VideoTracks";
@@ -835,10 +837,13 @@ impl ProjectParser {
                         if is_video { &mut video_clips } else { &mut audio_clips });
                 }
             }
+        } else {
+            tracing::debug!("Sequence '{}' has NO refs by UID", sequence.name);
         }
 
         // Also check refs by ID (some sequences might use ID)
         if let Some(seq_refs) = state.refs_from_id.get(sequence_uid) {
+            tracing::debug!("Sequence '{}' has {} refs by ID", sequence.name, seq_refs.len());
             for (ref_tag, target, is_guid) in seq_refs {
                 if ref_tag == "VideoTracks" || ref_tag == "AudioTracks" {
                     let is_video = ref_tag == "VideoTracks";
@@ -846,6 +851,51 @@ impl ProjectParser {
                         if is_video { &mut video_clips } else { &mut audio_clips });
                 }
             }
+        }
+
+        // FALLBACK: If we didn't find clips through the reference chain,
+        // add all clips with media to this sequence (simplified approach)
+        // This ensures Used Media shows SOMETHING while we debug the proper hierarchy
+        if video_clips.is_empty() && audio_clips.is_empty() {
+            tracing::warn!("Sequence '{}': No clips found via refs, using fallback with {} clips",
+                sequence.name, clip_to_media.len());
+
+            // Add all clips that have media references
+            let mut found_video = 0;
+            let mut found_audio = 0;
+            let mut not_found = 0;
+
+            for (clip_id, media_uid) in clip_to_media {
+                if let Some(objs) = state.objects_by_id.get(clip_id) {
+                    for obj in objs {
+                        let clip = TrackClip {
+                            object_id: clip_id.clone(),
+                            name: String::new(),
+                            start_ticks: 0,
+                            end_ticks: 0,
+                            in_point_ticks: 0,
+                            out_point_ticks: 0,
+                            media_ref: Some(media_uid.clone()),
+                            clip_type: ClipType::Standard,
+                            speed: 1.0,
+                        };
+
+                        if obj.tag == "VideoClipTrackItem" {
+                            video_clips.push(clip);
+                            found_video += 1;
+                        } else if obj.tag == "AudioClipTrackItem" {
+                            audio_clips.push(clip);
+                            found_audio += 1;
+                        }
+                        break;
+                    }
+                } else {
+                    not_found += 1;
+                }
+            }
+
+            tracing::warn!("Fallback result: {} video, {} audio, {} not found in objects_by_id",
+                found_video, found_audio, not_found);
         }
 
         // Create a single track for each type with all clips

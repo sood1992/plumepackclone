@@ -1,6 +1,6 @@
-mod project_parser;
-mod media_scanner;
-mod sequence_analyzer;
+pub mod project_parser;
+pub mod media_scanner;
+pub mod sequence_analyzer;
 mod ffmpeg;
 mod consolidation;
 mod commands;

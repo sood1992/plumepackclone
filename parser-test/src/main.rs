@@ -373,6 +373,127 @@ fn parse_xml(xml_content: &str) -> Result<()> {
     println!("Clips resolved to media: {}", clips_resolved_to_media);
     println!("Unique media files used: {}", used_media_uids.len());
 
+    // Simulate what populate_sequence_tracks does
+    println!("\n=== Simulating populate_sequence_tracks Fallback ===");
+
+    // Build clip_to_media mapping (same as project_parser.rs)
+    let mut clip_to_media: HashMap<String, String> = HashMap::new();
+    for (clip_id, _) in &clip_items {
+        if let Some(media_uid) = find_media_for_clip(clip_id, &state, 0) {
+            clip_to_media.insert(clip_id.to_string(), media_uid);
+        }
+    }
+    println!("clip_to_media has {} entries", clip_to_media.len());
+
+    // Now simulate the fallback
+    let mut video_clips = 0;
+    let mut audio_clips = 0;
+    let mut not_found = 0;
+    let mut other_tag = 0;
+
+    for (clip_id, media_uid) in &clip_to_media {
+        if let Some(objs) = state.objects_by_id.get(clip_id) {
+            let mut found_this = false;
+            for obj in objs {
+                if obj.tag == "VideoClipTrackItem" {
+                    video_clips += 1;
+                    found_this = true;
+                    break;
+                } else if obj.tag == "AudioClipTrackItem" {
+                    audio_clips += 1;
+                    found_this = true;
+                    break;
+                }
+            }
+            if !found_this {
+                other_tag += 1;
+                // Show what tag it actually has
+                if other_tag <= 5 {
+                    let tags: Vec<_> = objs.iter().map(|o| o.tag.as_str()).collect();
+                    println!("  Clip {} has tags: {:?} but not Video/AudioClipTrackItem", clip_id, tags);
+                }
+            }
+        } else {
+            not_found += 1;
+            if not_found <= 5 {
+                println!("  Clip {} not found in objects_by_id", clip_id);
+            }
+        }
+    }
+
+    println!("\nFallback simulation result:");
+    println!("  Video clips: {}", video_clips);
+    println!("  Audio clips: {}", audio_clips);
+    println!("  Not found in objects_by_id: {}", not_found);
+    println!("  Other tag types: {}", other_tag);
+
+    // Now simulate what SequenceAnalyzer would do
+    println!("\n=== Simulating SequenceAnalyzer ===");
+    let mut total_used_media: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // First, check what refs sequences actually have
+    println!("\n=== Sequence References ===");
+    for (uid, obj) in &state.objects_by_uid {
+        if obj.tag == "Sequence" {
+            let class_id = obj.attributes.get("ClassID").map(|s| s.as_str()).unwrap_or("");
+            if class_id == SEQUENCE_CLASS_ID {
+                let name = obj.children.get("Name").and_then(|v| v.first()).cloned().unwrap_or_default();
+
+                // Check refs from this sequence's UID
+                let refs_by_uid = state.refs_from_uid.get(uid);
+                let refs_by_id = state.refs_from_id.get(uid);
+
+                let uid_ref_count = refs_by_uid.map(|v| v.len()).unwrap_or(0);
+                let id_ref_count = refs_by_id.map(|v| v.len()).unwrap_or(0);
+
+                println!("  Sequence '{}' (UID={})", name, uid);
+                println!("    refs_from_uid: {} refs, refs_from_id: {} refs", uid_ref_count, id_ref_count);
+
+                // Show first 5 refs
+                if let Some(refs) = refs_by_uid {
+                    for (tag, target, is_guid) in refs.iter().take(5) {
+                        println!("      UID ref: {} -> {} (guid: {})", tag, target, is_guid);
+                    }
+                }
+                if let Some(refs) = refs_by_id {
+                    for (tag, target, is_guid) in refs.iter().take(5) {
+                        println!("      ID ref: {} -> {} (guid: {})", tag, target, is_guid);
+                    }
+                }
+
+                // Check if sequence has VideoTracks or AudioTracks refs
+                let has_video_tracks_ref = refs_by_uid.map_or(false, |refs| refs.iter().any(|(tag, _, _)| tag == "VideoTracks"));
+                let has_audio_tracks_ref = refs_by_uid.map_or(false, |refs| refs.iter().any(|(tag, _, _)| tag == "AudioTracks"));
+                println!("    Has VideoTracks ref: {}, Has AudioTracks ref: {}", has_video_tracks_ref, has_audio_tracks_ref);
+            }
+        }
+    }
+
+    // For each sequence, count how many clips would be analyzed
+    for (uid, obj) in &state.objects_by_uid {
+        if obj.tag == "Sequence" {
+            let class_id = obj.attributes.get("ClassID").map(|s| s.as_str()).unwrap_or("");
+            if class_id == SEQUENCE_CLASS_ID {
+                let name = obj.children.get("Name").and_then(|v| v.first()).cloned().unwrap_or_default();
+
+                // In the fallback, ALL clips get added to each sequence
+                // So each sequence would have video_clips + audio_clips clips
+                // And the media_refs would all be counted
+
+                // Collect unique media from clips
+                for (_, media_uid) in &clip_to_media {
+                    total_used_media.insert(media_uid.clone());
+                }
+
+                println!("  Sequence '{}' would have {} video + {} audio clips",
+                    name, video_clips, audio_clips);
+            }
+        }
+    }
+
+    println!("\nTotal unique media that would be marked as used: {}", total_used_media.len());
+    println!("Total media files in project: {}", state.media_file_paths.len());
+
     Ok(())
 }
 
