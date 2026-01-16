@@ -250,6 +250,9 @@ impl ProjectParser {
             current_text: String::new(),
         };
 
+        // Separate storage for file paths found anywhere in the XML
+        let mut file_paths: Vec<(String, PathBuf)> = Vec::new(); // (parent_object_id, path)
+
         let mut buf = Vec::new();
 
         loop {
@@ -296,6 +299,36 @@ impl ProjectParser {
                 Ok(Event::Text(e)) => {
                     state.current_text = e.unescape().unwrap_or_default().to_string();
 
+                    // Check if current element is a file path element
+                    let current_tag = state.current_element.last().map(|s| s.as_str()).unwrap_or("");
+                    let is_file_path_element = matches!(current_tag,
+                        "ActualMediaFilePath" | "FilePath" | "MediaFilePath" |
+                        "SourceFilePath" | "Path" | "ImportedFilePath" |
+                        "OriginalFilePath" | "RelativeFilePath" | "AbsoluteFilePath"
+                    );
+
+                    // If it looks like a file path, store it
+                    if is_file_path_element ||
+                       (state.current_text.len() > 5 &&
+                        (state.current_text.contains('/') || state.current_text.contains('\\')) &&
+                        !state.current_text.contains("Peak Files") &&
+                        !state.current_text.ends_with(".pek") &&
+                        (state.current_text.ends_with(".mp4") || state.current_text.ends_with(".mov") ||
+                         state.current_text.ends_with(".mxf") || state.current_text.ends_with(".wav") ||
+                         state.current_text.ends_with(".mp3") || state.current_text.ends_with(".avi") ||
+                         state.current_text.ends_with(".r3d") || state.current_text.ends_with(".braw") ||
+                         state.current_text.ends_with(".MP4") || state.current_text.ends_with(".MOV") ||
+                         state.current_text.ends_with(".MXF") || state.current_text.ends_with(".WAV") ||
+                         state.current_text.ends_with(".m4a") || state.current_text.ends_with(".aif") ||
+                         state.current_text.ends_with(".aiff") || state.current_text.ends_with(".png") ||
+                         state.current_text.ends_with(".jpg") || state.current_text.ends_with(".jpeg") ||
+                         state.current_text.ends_with(".tiff") || state.current_text.ends_with(".tif"))) {
+                        let parent_id = state.current_object_id.clone().unwrap_or_else(|| "unknown".to_string());
+                        let path_str = state.current_text.clone();
+                        tracing::info!("Found media file path in {}: {} (parent: {})", current_tag, path_str, parent_id);
+                        file_paths.push((parent_id, PathBuf::from(path_str)));
+                    }
+
                     // Store text content for current path
                     if let Some(ref obj_id) = state.current_object_id {
                         if let Some(obj) = state.objects.get_mut(obj_id) {
@@ -317,6 +350,32 @@ impl ProjectParser {
                 _ => {}
             }
             buf.clear();
+        }
+
+        tracing::info!("Found {} direct file paths in XML", file_paths.len());
+
+        // Create media files from the file paths we found
+        for (parent_id, file_path) in &file_paths {
+            if !project.media_files.contains_key(parent_id) {
+                let ext = file_path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let media_type = MediaType::from_extension(&ext);
+
+                let media = MediaFile {
+                    object_id: parent_id.clone(),
+                    file_path: file_path.clone(),
+                    has_video: matches!(media_type, MediaType::Video | MediaType::Image | MediaType::ImageSequence | MediaType::RED | MediaType::BRAW),
+                    has_audio: matches!(media_type, MediaType::Audio | MediaType::Video),
+                    duration_ticks: 0,
+                    frame_rate: None,
+                    proxy_path: None,
+                    is_offline: !file_path.exists(),
+                    media_type,
+                };
+                project.media_files.insert(parent_id.clone(), media);
+            }
         }
 
         // Process parsed objects into structured data
