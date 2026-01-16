@@ -299,34 +299,45 @@ impl ProjectParser {
                 Ok(Event::Text(e)) => {
                     state.current_text = e.unescape().unwrap_or_default().to_string();
 
-                    // Check if current element is a file path element
+                    // Check if current element is a file path element (based on Premiere XML structure)
                     let current_tag = state.current_element.last().map(|s| s.as_str()).unwrap_or("");
                     let is_file_path_element = matches!(current_tag,
                         "ActualMediaFilePath" | "FilePath" | "MediaFilePath" |
-                        "SourceFilePath" | "Path" | "ImportedFilePath" |
-                        "OriginalFilePath" | "RelativeFilePath" | "AbsoluteFilePath"
+                        "RelativePath" | "MediaFileHistory"
                     );
 
-                    // If it looks like a file path, store it
-                    if is_file_path_element ||
-                       (state.current_text.len() > 5 &&
-                        (state.current_text.contains('/') || state.current_text.contains('\\')) &&
-                        !state.current_text.contains("Peak Files") &&
-                        !state.current_text.ends_with(".pek") &&
-                        (state.current_text.ends_with(".mp4") || state.current_text.ends_with(".mov") ||
-                         state.current_text.ends_with(".mxf") || state.current_text.ends_with(".wav") ||
-                         state.current_text.ends_with(".mp3") || state.current_text.ends_with(".avi") ||
-                         state.current_text.ends_with(".r3d") || state.current_text.ends_with(".braw") ||
-                         state.current_text.ends_with(".MP4") || state.current_text.ends_with(".MOV") ||
-                         state.current_text.ends_with(".MXF") || state.current_text.ends_with(".WAV") ||
-                         state.current_text.ends_with(".m4a") || state.current_text.ends_with(".aif") ||
-                         state.current_text.ends_with(".aiff") || state.current_text.ends_with(".png") ||
-                         state.current_text.ends_with(".jpg") || state.current_text.ends_with(".jpeg") ||
-                         state.current_text.ends_with(".tiff") || state.current_text.ends_with(".tif"))) {
+                    // Check if the content looks like an actual file path
+                    let text = &state.current_text;
+                    let looks_like_path = text.len() > 5 &&
+                        (text.contains('/') || text.contains('\\')) &&
+                        // Exclude cache/temp files
+                        !text.contains("Peak Files") &&
+                        !text.contains("Audio Previews") &&
+                        !text.ends_with(".pek") &&
+                        !text.ends_with(".cfa") &&
+                        // Must not be just a number
+                        !text.chars().all(|c| c.is_ascii_digit());
+
+                    // Check for valid media extensions
+                    let text_lower = text.to_lowercase();
+                    let has_media_extension =
+                        text_lower.ends_with(".mp4") || text_lower.ends_with(".mov") ||
+                        text_lower.ends_with(".mxf") || text_lower.ends_with(".wav") ||
+                        text_lower.ends_with(".mp3") || text_lower.ends_with(".avi") ||
+                        text_lower.ends_with(".r3d") || text_lower.ends_with(".braw") ||
+                        text_lower.ends_with(".m4a") || text_lower.ends_with(".aif") ||
+                        text_lower.ends_with(".aiff") || text_lower.ends_with(".png") ||
+                        text_lower.ends_with(".jpg") || text_lower.ends_with(".jpeg") ||
+                        text_lower.ends_with(".tiff") || text_lower.ends_with(".tif") ||
+                        text_lower.ends_with(".aep") || text_lower.ends_with(".mogrt") ||
+                        text_lower.ends_with(".prproj") || text_lower.ends_with(".gif") ||
+                        text_lower.ends_with(".webm") || text_lower.ends_with(".mkv");
+
+                    // Store if it's a file path element with valid content
+                    if is_file_path_element && looks_like_path && has_media_extension {
                         let parent_id = state.current_object_id.clone().unwrap_or_else(|| "unknown".to_string());
-                        let path_str = state.current_text.clone();
-                        tracing::info!("Found media file path in {}: {} (parent: {})", current_tag, path_str, parent_id);
-                        file_paths.push((parent_id, PathBuf::from(path_str)));
+                        tracing::info!("Found media file path in {}: {} (parent: {})", current_tag, text, parent_id);
+                        file_paths.push((parent_id, PathBuf::from(text.clone())));
                     }
 
                     // Store text content for current path
@@ -390,50 +401,17 @@ impl ProjectParser {
         objects: &HashMap<String, XmlObject>,
         project: &mut PremiereProject,
     ) -> Result<()> {
-        // Debug: Log all unique tags found
-        let mut tag_counts: HashMap<String, usize> = HashMap::new();
-        for obj in objects.values() {
-            *tag_counts.entry(obj.tag.clone()).or_insert(0) += 1;
-        }
-        tracing::info!("Found {} objects with tags: {:?}", objects.len(), tag_counts);
-
-        // First pass: look for any objects that contain file paths
-        let mut file_path_objects: Vec<(String, String, String)> = Vec::new();
-        for (id, obj) in objects {
-            for (key, values) in &obj.children {
-                for val in values {
-                    // Look for file paths (contains path separator and file extension)
-                    if (val.contains("/") || val.contains("\\")) &&
-                       (val.contains(".mp4") || val.contains(".mov") || val.contains(".mxf") ||
-                        val.contains(".wav") || val.contains(".mp3") || val.contains(".avi") ||
-                        val.contains(".r3d") || val.contains(".braw") || val.contains(".prproj") ||
-                        val.ends_with(".MOV") || val.ends_with(".MP4")) {
-                        file_path_objects.push((obj.tag.clone(), key.clone(), val.clone()));
-                        tracing::info!("Found file path in {} ({}): {} = {}", obj.tag, id, key, val);
-                    }
-                }
-            }
-        }
-        tracing::info!("Total file paths found: {}", file_path_objects.len());
-
         for (id, obj) in objects {
             match obj.tag.as_str() {
                 // Premiere Pro uses VideoSequenceSource for sequences
                 "VideoSequenceSource" => {
                     if let Some(sequence) = self.parse_sequence(id, obj, objects) {
-                        tracing::info!("Found sequence: {} ({})", sequence.name, id);
                         project.sequences.push(sequence);
                     }
                 }
                 "Bin" | "BinProjectItem" | "RootProjectItem" => {
                     if let Some(bin) = self.parse_bin(id, obj) {
                         project.bins.push(bin);
-                    }
-                }
-                // Try VideoStream and AudioStream - these might have file refs
-                "VideoStream" | "AudioStream" | "DataStream" => {
-                    if let Some(media) = self.parse_media_file(id, obj) {
-                        project.media_files.insert(id.clone(), media);
                     }
                 }
                 "ClipProjectItem" | "ProjectItem" | "SubClip" => {
@@ -457,21 +435,14 @@ impl ProjectParser {
         obj: &XmlObject,
         _objects: &HashMap<String, XmlObject>,
     ) -> Option<Sequence> {
-        // Debug: log attributes and children keys for first sequence
-        tracing::debug!("VideoSequenceSource {} attributes: {:?}", id, obj.attributes);
-        tracing::debug!("VideoSequenceSource {} children keys: {:?}", id, obj.children.keys().collect::<Vec<_>>());
-
         // Try various attribute/child names for the sequence name
         let name = obj
             .attributes
             .get("Name")
             .or_else(|| obj.attributes.get("ObjectName"))
             .or_else(|| obj.children.get("Name").and_then(|v| v.first()))
-            .or_else(|| obj.children.get("VideoSequenceSource/Name").and_then(|v| v.first()))
             .cloned()
             .unwrap_or_else(|| format!("Sequence {}", id));
-
-        tracing::info!("Parsed sequence name: {}", name);
 
         Some(Sequence {
             object_id: id.to_string(),
@@ -504,72 +475,10 @@ impl ProjectParser {
         })
     }
 
-    fn parse_media_file(&self, id: &str, obj: &XmlObject) -> Option<MediaFile> {
-        // Debug: log what's in the media source object
-        tracing::info!("Parsing media source {} ({}), attributes: {:?}", id, obj.tag, obj.attributes.keys().collect::<Vec<_>>());
-        tracing::info!("Media source {} children keys: {:?}", id, obj.children.keys().take(10).collect::<Vec<_>>());
-
-        // Try to find the file path in various locations used by Premiere Pro
-        let file_path = obj
-            .children
-            .get("FilePath")
-            .or_else(|| obj.children.get("Media/FilePath"))
-            .or_else(|| obj.children.get("ActualMediaFilePath"))
-            .or_else(|| obj.children.get("MediaFilePath"))
-            .or_else(|| obj.children.get("VideoMediaSource/FilePath"))
-            .or_else(|| obj.children.get("AudioMediaSource/FilePath"))
-            .or_else(|| obj.children.get("ImporterPrefs/MediaFilePath"))
-            .and_then(|v| v.first())
-            .map(|s| PathBuf::from(s))
-            .or_else(|| obj.attributes.get("FilePath").map(|s| PathBuf::from(s)))
-            .or_else(|| obj.attributes.get("MediaFilePath").map(|s| PathBuf::from(s)));
-
-        // Log if we found a path or not
-        if let Some(ref path) = file_path {
-            tracing::info!("Found file path for {}: {:?}", id, path);
-        } else {
-            tracing::warn!("No file path found for media source {}", id);
-            // Try to find any child that looks like a path
-            for (key, values) in &obj.children {
-                if let Some(val) = values.first() {
-                    if val.contains("/") || val.contains("\\") || val.contains(".") {
-                        tracing::info!("  Potential path in {}: {}", key, val);
-                    }
-                }
-            }
-            return None;
-        }
-
-        let file_path = file_path?;
-
-        let ext = file_path
-            .extension()
-            .map(|e| e.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        let media_type = MediaType::from_extension(&ext);
-
-        let proxy_path = obj
-            .children
-            .get("ProxyFilePath")
-            .or_else(|| obj.children.get("Proxy/FilePath"))
-            .and_then(|v| v.first())
-            .map(|s| PathBuf::from(s));
-
-        Some(MediaFile {
-            object_id: id.to_string(),
-            file_path,
-            has_video: matches!(
-                media_type,
-                MediaType::Video | MediaType::Image | MediaType::ImageSequence | MediaType::RED | MediaType::BRAW
-            ),
-            has_audio: matches!(media_type, MediaType::Audio | MediaType::Video),
-            duration_ticks: 0,
-            frame_rate: None,
-            proxy_path,
-            is_offline: false,
-            media_type,
-        })
+    // Note: Media files are now parsed directly in parse_xml from FilePath elements
+    #[allow(dead_code)]
+    fn parse_media_file(&self, _id: &str, _obj: &XmlObject) -> Option<MediaFile> {
+        None
     }
 
     fn parse_project_item(&self, id: &str, obj: &XmlObject) -> Option<ProjectItem> {
