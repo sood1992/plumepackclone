@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    plumepack_temp_lib::run()
+    plumepack_clone_lib::run()
 }
