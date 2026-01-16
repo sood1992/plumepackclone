@@ -331,14 +331,34 @@ impl ProjectParser {
         objects: &HashMap<String, XmlObject>,
         project: &mut PremiereProject,
     ) -> Result<()> {
+        // Debug: Log all unique tags found
+        let mut tag_counts: HashMap<String, usize> = HashMap::new();
+        for obj in objects.values() {
+            *tag_counts.entry(obj.tag.clone()).or_insert(0) += 1;
+        }
+        tracing::info!("Found {} objects with tags: {:?}", objects.len(), tag_counts);
+
         for (id, obj) in objects {
             match obj.tag.as_str() {
-                "Sequence" => {
+                // Premiere Pro uses various sequence-related tags
+                "Sequence" | "VideoSequence" => {
                     if let Some(sequence) = self.parse_sequence(id, obj, objects) {
+                        tracing::info!("Found sequence: {} ({})", sequence.name, id);
                         project.sequences.push(sequence);
                     }
                 }
-                "Bin" | "BinProjectItem" => {
+                "MasterClip" => {
+                    // MasterClip can be a sequence or media reference - check for timeline properties
+                    if obj.children.contains_key("VideoTracks") || obj.children.contains_key("AudioTracks") {
+                        if let Some(sequence) = self.parse_sequence(id, obj, objects) {
+                            tracing::info!("Found sequence from MasterClip: {} ({})", sequence.name, id);
+                            project.sequences.push(sequence);
+                        }
+                    } else if let Some(media) = self.parse_media_file(id, obj) {
+                        project.media_files.insert(id.clone(), media);
+                    }
+                }
+                "Bin" | "BinProjectItem" | "RootProjectItem" => {
                     if let Some(bin) = self.parse_bin(id, obj) {
                         project.bins.push(bin);
                     }
@@ -349,6 +369,10 @@ impl ProjectParser {
                     }
                 }
                 "ClipProjectItem" | "ProjectItem" => {
+                    // Try to extract media file reference
+                    if let Some(media) = self.parse_media_file(id, obj) {
+                        project.media_files.insert(id.clone(), media);
+                    }
                     if let Some(item) = self.parse_project_item(id, obj) {
                         project.project_items.insert(id.clone(), item);
                     }
