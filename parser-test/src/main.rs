@@ -304,6 +304,27 @@ fn parse_xml(xml_content: &str) -> Result<()> {
     println!("\n=== Clip Track Items ===");
     println!("Total clip track items: {}", clip_items.len());
 
+    // Debug: Show sample clip IDs
+    println!("\nSample clip IDs (first 5):");
+    for (i, (clip_id, clip_obj)) in clip_items.iter().take(5).enumerate() {
+        println!("  {}. ID='{}' tag={}", i+1, clip_id, clip_obj.tag);
+    }
+
+    // Debug: Show sample refs_from_id keys
+    println!("\nSample refs_from_id keys (first 10):");
+    for (i, (key, refs)) in state.refs_from_id.iter().take(10).enumerate() {
+        println!("  {}. key='{}' -> {} refs", i+1, key, refs.len());
+    }
+
+    // Debug: Check if any clip IDs exist in refs_from_id
+    let clip_ids: std::collections::HashSet<&String> = clip_items.iter().map(|(id, _)| *id).collect();
+    let ref_keys: std::collections::HashSet<&String> = state.refs_from_id.keys().collect();
+    let intersection: Vec<_> = clip_ids.intersection(&ref_keys).collect();
+    println!("\nClip IDs that have refs: {} (out of {} clips)", intersection.len(), clip_items.len());
+    for id in intersection.iter().take(5) {
+        println!("  - {}", id);
+    }
+
     let mut clips_with_refs = 0;
     let mut clips_without_refs = 0;
     let mut clips_resolved_to_media = 0;
