@@ -1,5 +1,6 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { FolderOpen, FileVideo, Upload } from 'lucide-react';
 
 interface ProjectDropZoneProps {
@@ -10,6 +11,42 @@ interface ProjectDropZoneProps {
 export function ProjectDropZone({ onProjectSelect, isLoading }: ProjectDropZoneProps) {
   const [isDragging, setIsDragging] = useState(false);
 
+  // Set up Tauri drag-drop listener
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    const setupDragDrop = async () => {
+      try {
+        const window = getCurrentWindow();
+        unlisten = await window.onDragDropEvent((event) => {
+          if (event.payload.type === 'enter' || event.payload.type === 'over') {
+            setIsDragging(true);
+          } else if (event.payload.type === 'drop') {
+            setIsDragging(false);
+            const paths = event.payload.paths;
+            const prprojPath = paths.find((p: string) => p.endsWith('.prproj'));
+            if (prprojPath) {
+              onProjectSelect(prprojPath);
+            }
+          } else if (event.payload.type === 'leave') {
+            setIsDragging(false);
+          }
+        });
+      } catch (err) {
+        console.error('Failed to set up drag-drop listener:', err);
+      }
+    };
+
+    setupDragDrop();
+
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [onProjectSelect]);
+
+  // Keep the visual drag handlers for CSS feedback
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(true);
@@ -23,16 +60,8 @@ export function ProjectDropZone({ onProjectSelect, isLoading }: ProjectDropZoneP
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
-
-    const files = Array.from(e.dataTransfer.files);
-    const prprojFile = files.find(f => f.name.endsWith('.prproj'));
-
-    if (prprojFile) {
-      // Note: In Tauri, we need to use the file path
-      // This is a simplified version - actual implementation may vary
-      onProjectSelect((prprojFile as any).path || prprojFile.name);
-    }
-  }, [onProjectSelect]);
+    // Actual file handling is done by Tauri's onDragDropEvent
+  }, []);
 
   const handleBrowse = async () => {
     try {

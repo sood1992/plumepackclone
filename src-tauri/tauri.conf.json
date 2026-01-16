@@ -37,17 +37,7 @@
   },
   "plugins": {
     "shell": {
-      "open": true,
-      "sidecar": [
-        {
-          "name": "ffmpeg",
-          "args": true
-        },
-        {
-          "name": "ffprobe",
-          "args": true
-        }
-      ]
+      "open": true
     }
   }
 }

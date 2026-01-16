@@ -189,6 +189,11 @@ impl ConsolidationEngine {
         self.cancel_flag.store(true, Ordering::SeqCst);
     }
 
+    /// Get the cancel flag for external tracking
+    pub fn get_cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancel_flag.clone()
+    }
+
     /// Run the consolidation process
     pub fn run(&self) -> Result<ConsolidationResult> {
         let start_time = std::time::Instant::now();

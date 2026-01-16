@@ -3,31 +3,74 @@
 //! These commands are exposed to the React frontend via Tauri's IPC.
 
 use crate::consolidation::{
-    ConsolidationConfig, ConsolidationEngine, ConsolidationProgress, ConsolidationResult,
+    ConsolidationConfig, ConsolidationEngine, ConsolidationProgress, ConsolidationStatus,
     FolderStructure, OptimizationMode, ProcessingModeConfig, ProxyMode,
 };
 use crate::ffmpeg::{FFmpeg, MediaMetadata, TranscodePreset};
-use crate::media_scanner::{MediaInventory, MediaInventoryItem, MediaScanner};
-use crate::project_parser::{Bin, MediaFile, PremiereProject, ProjectParser, Sequence};
-use crate::sequence_analyzer::{MediaUsageAnalysis, MediaUsageInfo, SequenceAnalyzer};
+use crate::media_scanner::MediaScanner;
+use crate::project_parser::{PremiereProject, ProjectParser};
+use crate::sequence_analyzer::SequenceAnalyzer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use tauri::State;
+
+/// Premiere ticks per second constant
+const TICKS_PER_SECOND: f64 = 254016000000.0;
 
 /// Application state for storing loaded projects and running jobs
 pub struct AppState {
-    pub current_project: Mutex<Option<PremiereProject>>,
-    pub running_jobs: Mutex<HashMap<String, Arc<ConsolidationEngine>>>,
+    /// Cache of parsed projects (path -> project)
+    pub project_cache: RwLock<HashMap<String, Arc<PremiereProject>>>,
+    /// Running consolidation jobs (job_id -> job info)
+    pub running_jobs: RwLock<HashMap<String, JobInfo>>,
+}
+
+/// Information about a running job
+pub struct JobInfo {
+    pub engine: Arc<ConsolidationEngine>,
+    pub cancel_flag: Arc<AtomicBool>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            current_project: Mutex::new(None),
-            running_jobs: Mutex::new(HashMap::new()),
+            project_cache: RwLock::new(HashMap::new()),
+            running_jobs: RwLock::new(HashMap::new()),
         }
+    }
+}
+
+impl AppState {
+    /// Get or parse a project, using cache if available
+    fn get_project(&self, path: &str) -> Result<Arc<PremiereProject>, String> {
+        // Check cache first
+        {
+            let cache = self.project_cache.read().unwrap();
+            if let Some(project) = cache.get(path) {
+                return Ok(project.clone());
+            }
+        }
+
+        // Parse and cache
+        let parser = ProjectParser::new(path);
+        let project = parser.parse().map_err(|e| e.to_string())?;
+        let project = Arc::new(project);
+
+        {
+            let mut cache = self.project_cache.write().unwrap();
+            cache.insert(path.to_string(), project.clone());
+        }
+
+        Ok(project)
+    }
+
+    /// Clear project from cache (e.g., when it might have changed)
+    fn invalidate_project(&self, path: &str) {
+        let mut cache = self.project_cache.write().unwrap();
+        cache.remove(path);
     }
 }
 
@@ -93,11 +136,11 @@ pub struct UsedMediaItem {
 pub struct ConsolidationOptions {
     pub output_path: String,
     pub sequences: Vec<String>,
-    pub processing_mode: String, // "trim", "transcode", "copy", "no_process"
+    pub processing_mode: String,
     pub transcode_preset: Option<String>,
-    pub optimization_mode: String, // "minimize", "keep_files", "unique_clips"
-    pub folder_structure: String,  // "flat", "bins", "original"
-    pub proxy_mode: String,        // "both", "proxy_only", "main_only", "preserve"
+    pub optimization_mode: String,
+    pub folder_structure: String,
+    pub proxy_mode: String,
     pub handle_frames: i64,
     pub include_all_multicam_angles: bool,
     pub generate_unique_filenames: bool,
@@ -109,46 +152,53 @@ pub struct ConsolidationOptions {
 
 /// Open and parse a Premiere Pro project file
 #[tauri::command]
-pub async fn open_project(path: String) -> Result<ProjectInfo, String> {
-    let path = PathBuf::from(&path);
+pub async fn open_project(path: String, state: State<'_, AppState>) -> Result<ProjectInfo, String> {
+    let path_buf = PathBuf::from(&path);
 
-    if !path.exists() {
+    if !path_buf.exists() {
         return Err("Project file not found".to_string());
     }
 
-    let parser = ProjectParser::new(&path);
-    let project = parser.parse().map_err(|e| e.to_string())?;
+    // Invalidate cache to force fresh parse when opening
+    state.invalidate_project(&path);
 
-    let info = ProjectInfo {
+    let project = state.get_project(&path)?;
+
+    Ok(ProjectInfo {
         name: project.name.clone(),
         file_path: project.file_path.to_string_lossy().to_string(),
         version: project.version,
         sequence_count: project.sequences.len(),
         media_count: project.media_files.len(),
         bin_count: project.bins.len(),
-    };
-
-    Ok(info)
+    })
 }
 
 /// Get full project info including parsed content
 #[tauri::command]
-pub async fn get_project_info(path: String) -> Result<ProjectInfo, String> {
-    open_project(path).await
+pub async fn get_project_info(path: String, state: State<'_, AppState>) -> Result<ProjectInfo, String> {
+    let project = state.get_project(&path)?;
+
+    Ok(ProjectInfo {
+        name: project.name.clone(),
+        file_path: project.file_path.to_string_lossy().to_string(),
+        version: project.version,
+        sequence_count: project.sequences.len(),
+        media_count: project.media_files.len(),
+        bin_count: project.bins.len(),
+    })
 }
 
 /// Get all sequences in the project
 #[tauri::command]
-pub async fn get_sequences(path: String) -> Result<Vec<SequenceInfo>, String> {
-    let path = PathBuf::from(&path);
-    let parser = ProjectParser::new(&path);
-    let project = parser.parse().map_err(|e| e.to_string())?;
+pub async fn get_sequences(path: String, state: State<'_, AppState>) -> Result<Vec<SequenceInfo>, String> {
+    let project = state.get_project(&path)?;
 
     let sequences: Vec<SequenceInfo> = project
         .sequences
         .iter()
         .map(|seq| {
-            let duration_seconds = seq.duration_ticks as f64 / 254016000000.0;
+            let duration_seconds = seq.duration_ticks as f64 / TICKS_PER_SECOND;
             SequenceInfo {
                 object_id: seq.object_id.clone(),
                 name: seq.name.clone(),
@@ -166,10 +216,8 @@ pub async fn get_sequences(path: String) -> Result<Vec<SequenceInfo>, String> {
 
 /// Get all media items in the project
 #[tauri::command]
-pub async fn get_media_items(path: String) -> Result<Vec<MediaItemInfo>, String> {
-    let path = PathBuf::from(&path);
-    let parser = ProjectParser::new(&path);
-    let project = parser.parse().map_err(|e| e.to_string())?;
+pub async fn get_media_items(path: String, state: State<'_, AppState>) -> Result<Vec<MediaItemInfo>, String> {
+    let project = state.get_project(&path)?;
 
     let scanner = MediaScanner::new(&project);
     let inventory = scanner.scan().map_err(|e| e.to_string())?;
@@ -200,10 +248,9 @@ pub async fn analyze_media_usage(
     sequence_ids: Vec<String>,
     handle_frames: i64,
     include_all_multicam: bool,
+    state: State<'_, AppState>,
 ) -> Result<MediaUsageResult, String> {
-    let path = PathBuf::from(&path);
-    let parser = ProjectParser::new(&path);
-    let project = parser.parse().map_err(|e| e.to_string())?;
+    let project = state.get_project(&path)?;
 
     let analyzer = SequenceAnalyzer::new(&project)
         .with_handles(handle_frames)
@@ -272,10 +319,9 @@ pub async fn analyze_media_usage(
 pub async fn get_unused_media(
     path: String,
     sequence_ids: Vec<String>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<MediaItemInfo>, String> {
-    let path = PathBuf::from(&path);
-    let parser = ProjectParser::new(&path);
-    let project = parser.parse().map_err(|e| e.to_string())?;
+    let project = state.get_project(&path)?;
 
     let analyzer = SequenceAnalyzer::new(&project);
     let usage = if sequence_ids.is_empty() {
@@ -312,18 +358,43 @@ pub async fn get_unused_media(
 pub async fn start_consolidation(
     project_path: String,
     options: ConsolidationOptions,
+    state: State<'_, AppState>,
 ) -> Result<String, String> {
     let config = build_consolidation_config(project_path, options)?;
 
     let engine = ConsolidationEngine::new(config).map_err(|e| e.to_string())?;
     let job_id = engine.get_progress().job_id.clone();
+    let cancel_flag = engine.get_cancel_flag();
 
-    // Run in background
+    // Store the job
     let engine_arc = Arc::new(engine);
+    {
+        let mut jobs = state.running_jobs.write().unwrap();
+        jobs.insert(
+            job_id.clone(),
+            JobInfo {
+                engine: engine_arc.clone(),
+                cancel_flag: cancel_flag.clone(),
+            },
+        );
+    }
+
+    // Run in background thread
     let engine_clone = engine_arc.clone();
+    let job_id_clone = job_id.clone();
+    let state_jobs = state.running_jobs.clone();
 
     std::thread::spawn(move || {
-        let _ = engine_clone.run();
+        let result = engine_clone.run();
+
+        // Log completion
+        match &result {
+            Ok(r) => tracing::info!("Job {} completed successfully: {} files processed", job_id_clone, r.files_processed),
+            Err(e) => tracing::error!("Job {} failed: {}", job_id_clone, e),
+        }
+
+        // Note: We keep the job in the map so progress can be queried
+        // It will be cleaned up when a new consolidation starts or manually
     });
 
     Ok(job_id)
@@ -331,17 +402,31 @@ pub async fn start_consolidation(
 
 /// Cancel a running consolidation job
 #[tauri::command]
-pub async fn cancel_consolidation(job_id: String) -> Result<(), String> {
-    // Note: In a real implementation, we'd track running jobs
-    // For now, this is a placeholder
-    Ok(())
+pub async fn cancel_consolidation(job_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let jobs = state.running_jobs.read().unwrap();
+
+    if let Some(job) = jobs.get(&job_id) {
+        job.cancel_flag.store(true, Ordering::SeqCst);
+        tracing::info!("Cancellation requested for job {}", job_id);
+        Ok(())
+    } else {
+        Err(format!("Job {} not found", job_id))
+    }
 }
 
 /// Get progress of a consolidation job
 #[tauri::command]
-pub async fn get_consolidation_progress(job_id: String) -> Result<ConsolidationProgress, String> {
-    // Note: In a real implementation, we'd look up the job
-    Err("Job not found".to_string())
+pub async fn get_consolidation_progress(
+    job_id: String,
+    state: State<'_, AppState>,
+) -> Result<ConsolidationProgress, String> {
+    let jobs = state.running_jobs.read().unwrap();
+
+    if let Some(job) = jobs.get(&job_id) {
+        Ok(job.engine.get_progress())
+    } else {
+        Err(format!("Job {} not found", job_id))
+    }
 }
 
 /// Check if FFmpeg is available
@@ -362,10 +447,10 @@ pub async fn get_media_metadata(path: String) -> Result<MediaMetadata, String> {
 pub async fn estimate_output_size(
     project_path: String,
     options: ConsolidationOptions,
+    state: State<'_, AppState>,
 ) -> Result<u64, String> {
-    let config = build_consolidation_config(project_path, options)?;
-    let parser = ProjectParser::new(&config.project_path);
-    let project = parser.parse().map_err(|e| e.to_string())?;
+    let config = build_consolidation_config(project_path.clone(), options)?;
+    let project = state.get_project(&project_path)?;
 
     crate::consolidation::estimate_output_size(&project, &config).map_err(|e| e.to_string())
 }
@@ -384,7 +469,6 @@ pub async fn validate_output_path(path: String) -> Result<bool, String> {
 
     // Check write permissions
     if path.exists() {
-        // Check if we can write to existing directory
         let test_file = path.join(".write_test");
         match std::fs::write(&test_file, "test") {
             Ok(_) => {
@@ -394,7 +478,6 @@ pub async fn validate_output_path(path: String) -> Result<bool, String> {
             Err(_) => Ok(false),
         }
     } else {
-        // Check if parent is writable
         if let Some(parent) = path.parent() {
             let test_file = parent.join(".write_test");
             match std::fs::write(&test_file, "test") {

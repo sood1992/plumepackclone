@@ -193,12 +193,21 @@ function App() {
         },
       });
 
+      // Update progress with the actual job ID
+      setConsolidationProgress(prev => prev ? {
+        ...prev,
+        job_id: jobId,
+        status: 'Processing',
+        current_operation: 'Starting consolidation...',
+      } : null);
+
       // Poll for progress
       const pollProgress = async () => {
         try {
           const progress = await invoke<ProgressType>('get_consolidation_progress', { jobId });
           setConsolidationProgress(progress);
 
+          // Continue polling if job is still running
           if (['Pending', 'Analyzing', 'Processing', 'WritingProject'].includes(progress.status)) {
             setTimeout(pollProgress, 500);
           }
@@ -207,13 +216,8 @@ function App() {
         }
       };
 
-      // Note: In a real implementation, we'd poll for progress
-      // For now, show a simulated progress
-      setConsolidationProgress(prev => prev ? {
-        ...prev,
-        status: 'Processing',
-        current_operation: 'Processing media files...',
-      } : null);
+      // Start polling for progress
+      pollProgress();
 
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
