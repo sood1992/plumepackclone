@@ -338,6 +338,25 @@ impl ProjectParser {
         }
         tracing::info!("Found {} objects with tags: {:?}", objects.len(), tag_counts);
 
+        // First pass: look for any objects that contain file paths
+        let mut file_path_objects: Vec<(String, String, String)> = Vec::new();
+        for (id, obj) in objects {
+            for (key, values) in &obj.children {
+                for val in values {
+                    // Look for file paths (contains path separator and file extension)
+                    if (val.contains("/") || val.contains("\\")) &&
+                       (val.contains(".mp4") || val.contains(".mov") || val.contains(".mxf") ||
+                        val.contains(".wav") || val.contains(".mp3") || val.contains(".avi") ||
+                        val.contains(".r3d") || val.contains(".braw") || val.contains(".prproj") ||
+                        val.ends_with(".MOV") || val.ends_with(".MP4")) {
+                        file_path_objects.push((obj.tag.clone(), key.clone(), val.clone()));
+                        tracing::info!("Found file path in {} ({}): {} = {}", obj.tag, id, key, val);
+                    }
+                }
+            }
+        }
+        tracing::info!("Total file paths found: {}", file_path_objects.len());
+
         for (id, obj) in objects {
             match obj.tag.as_str() {
                 // Premiere Pro uses VideoSequenceSource for sequences
@@ -352,8 +371,8 @@ impl ProjectParser {
                         project.bins.push(bin);
                     }
                 }
-                // Media sources - these contain file paths
-                "VideoMediaSource" | "AudioMediaSource" => {
+                // Try VideoStream and AudioStream - these might have file refs
+                "VideoStream" | "AudioStream" | "DataStream" => {
                     if let Some(media) = self.parse_media_file(id, obj) {
                         project.media_files.insert(id.clone(), media);
                     }
