@@ -442,8 +442,12 @@ impl FFmpeg {
             &format!("{:.6}", duration),
             "-c",
             "copy",
+            // Only map video and audio streams, not data/metadata streams
+            // Data streams (rtmd, timecode, etc.) often can't be written to MP4 containers
             "-map",
-            "0",
+            "0:v?",    // Map all video streams (? = optional if none exist)
+            "-map",
+            "0:a?",    // Map all audio streams (? = optional if none exist)
             // Avoid negative timestamps
             "-avoid_negative_ts",
             "make_zero",
