@@ -572,46 +572,70 @@ impl ProjectParser {
         // For each clip track item, follow the reference chain to find media
         let mut clips_with_refs = 0;
         let mut clips_without_refs = 0;
-        for (clip_id, _clip_obj) in &clip_items {
+        let mut clips_resolved_to_media = 0;
+
+        for (clip_id, clip_obj) in &clip_items {
             // Check if this clip has any refs at all
-            let has_refs = state.refs_from_id.contains_key(*clip_id) || state.refs_from_uid.contains_key(*clip_id);
+            let refs_by_id = state.refs_from_id.get(*clip_id);
+            let refs_by_uid = state.refs_from_uid.get(*clip_id);
+            let has_refs = refs_by_id.is_some() || refs_by_uid.is_some();
+
             if !has_refs {
                 clips_without_refs += 1;
                 if clips_without_refs <= 3 {
-                    tracing::warn!("Clip {} has NO refs!", clip_id);
+                    tracing::warn!("Clip {} ({}) has NO refs! attrs: {:?}",
+                        clip_id, clip_obj.tag, clip_obj.attributes.keys().collect::<Vec<_>>());
                 }
             } else {
                 clips_with_refs += 1;
+                // Log the refs for first few clips
+                if clips_with_refs <= 3 {
+                    if let Some(refs) = refs_by_id {
+                        tracing::info!("Clip {} refs from ID: {:?}", clip_id, refs);
+                    }
+                    if let Some(refs) = refs_by_uid {
+                        tracing::info!("Clip {} refs from UID: {:?}", clip_id, refs);
+                    }
+                }
             }
 
             if let Some(media_uid) = self.find_media_for_clip(clip_id, state, 0) {
-                tracing::debug!("Clip {} -> Media {}", clip_id, media_uid);
+                clips_resolved_to_media += 1;
+                if clips_resolved_to_media <= 5 {
+                    tracing::info!("SUCCESS: Clip {} -> Media {}", clip_id, media_uid);
+                }
                 used_media_uids.insert(media_uid);
             }
         }
 
+        tracing::info!("Clip summary: {} with refs, {} without refs, {} resolved to media",
+            clips_with_refs, clips_without_refs, clips_resolved_to_media);
+
         tracing::info!("Clips with refs: {}, without refs: {}", clips_with_refs, clips_without_refs);
         tracing::info!("Found {} unique media files used by clips", used_media_uids.len());
 
-        // Process sequences (they use ObjectUID)
+        // Process sequences - ONLY real Sequence objects with correct ClassID
+        // Real Sequence ClassID: 6a15d903-8739-11d5-af2d-9b7855ad8974
+        const SEQUENCE_CLASS_ID: &str = "6a15d903-8739-11d5-af2d-9b7855ad8974";
+
         for (uid, obj) in &state.objects_by_uid {
             if obj.tag == "Sequence" {
-                if let Some(sequence) = self.parse_sequence_from_obj(uid, obj) {
-                    project.sequences.push(sequence);
+                // Check ClassID to filter out non-sequences
+                let class_id = obj.attributes.get("ClassID").map(|s| s.as_str()).unwrap_or("");
+                if class_id == SEQUENCE_CLASS_ID {
+                    if let Some(sequence) = self.parse_sequence_from_obj(uid, obj) {
+                        project.sequences.push(sequence);
+                    }
+                } else {
+                    tracing::debug!("Skipping non-Sequence with tag 'Sequence', ClassID: {}", class_id);
                 }
             }
         }
 
-        // Also check by ID for VideoSequenceSource (flatten Vec)
-        for (id, objs) in &state.objects_by_id {
-            for obj in objs {
-                if obj.tag == "VideoSequenceSource" {
-                    if let Some(sequence) = self.parse_sequence_from_obj(id, obj) {
-                        project.sequences.push(sequence);
-                    }
-                }
-            }
-        }
+        // NOTE: Removed VideoSequenceSource fallback - those are not real sequences
+        // They were creating fake "Sequence 315" etc. entries
+
+        tracing::info!("Found {} real sequences", project.sequences.len());
 
         // Process bins (flatten Vec for objects_by_id)
         for (id, objs) in &state.objects_by_id {
@@ -656,6 +680,14 @@ impl ProjectParser {
             .flat_map(|v| v.iter())
             .chain(refs_from_uid.into_iter().flat_map(|v| v.iter()))
             .collect();
+
+        // Log at depth 0 for debugging
+        if depth == 0 && all_refs.is_empty() {
+            tracing::debug!("find_media_for_clip: {} has NO refs at depth 0", start_id);
+        } else if depth <= 2 && !all_refs.is_empty() {
+            tracing::debug!("find_media_for_clip depth {}: {} has {} refs: {:?}",
+                depth, start_id, all_refs.len(), all_refs.iter().take(3).collect::<Vec<_>>());
+        }
 
         for (ref_element_tag, target, is_guid) in all_refs {
             // If target is a GUID reference
