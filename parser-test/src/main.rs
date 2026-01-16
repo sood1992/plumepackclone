@@ -427,6 +427,71 @@ fn parse_xml(xml_content: &str) -> Result<()> {
     println!("  Not found in objects_by_id: {}", not_found);
     println!("  Other tag types: {}", other_tag);
 
+    // Debug: Show what children clip track items actually have
+    println!("\n=== Clip Track Item Children (first 3) ===");
+    let mut shown = 0;
+    for (clip_id, _) in &clip_to_media {
+        if shown >= 3 {
+            break;
+        }
+        if let Some(objs) = state.objects_by_id.get(clip_id) {
+            for obj in objs {
+                if obj.tag == "VideoClipTrackItem" || obj.tag == "AudioClipTrackItem" {
+                    println!("  Clip {} ({}):", clip_id, obj.tag);
+                    println!("    All children keys: {:?}", obj.children.keys().collect::<Vec<_>>());
+                    // Show values for time-related keys
+                    for key in ["Start", "End", "InPoint", "OutPoint", "MZ.Start", "MZ.End",
+                                "MZ.InPoint", "MZ.OutPoint", "Duration", "MZ.Duration"] {
+                        if let Some(vals) = obj.children.get(key) {
+                            println!("    {}: {:?}", key, vals);
+                        }
+                    }
+
+                    // Now follow refs to find SubClip and show its children
+                    if let Some(refs) = state.refs_from_id.get(clip_id) {
+                        for (ref_tag, target_id, _is_guid) in refs {
+                            if ref_tag == "SubClip" {
+                                println!("    -> Following SubClip ref to {}", target_id);
+                                if let Some(subclip_objs) = state.objects_by_id.get(target_id) {
+                                    for subclip in subclip_objs {
+                                        println!("       SubClip {} children: {:?}", target_id, subclip.children.keys().collect::<Vec<_>>());
+                                        for key in ["Start", "End", "InPoint", "OutPoint", "StartOffset", "EndOffset"] {
+                                            if let Some(vals) = subclip.children.get(key) {
+                                                println!("       SubClip {}: {:?}", key, vals);
+                                            }
+                                        }
+
+                                        // Follow Clip ref from SubClip
+                                        if let Some(subclip_refs) = state.refs_from_id.get(target_id) {
+                                            for (ref_tag2, target_id2, _) in subclip_refs {
+                                                if ref_tag2 == "Clip" {
+                                                    println!("       -> Following Clip ref to {}", target_id2);
+                                                    if let Some(clip_objs) = state.objects_by_id.get(target_id2) {
+                                                        for clip_obj in clip_objs {
+                                                            println!("          Clip {} children: {:?}", target_id2, clip_obj.children.keys().collect::<Vec<_>>());
+                                                            for key in ["Start", "End", "InPoint", "OutPoint", "Duration"] {
+                                                                if let Some(vals) = clip_obj.children.get(key) {
+                                                                    println!("          Clip {}: {:?}", key, vals);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    shown += 1;
+                    break;
+                }
+            }
+        }
+    }
+
     // Now simulate what SequenceAnalyzer would do
     println!("\n=== Simulating SequenceAnalyzer ===");
     let mut total_used_media: std::collections::HashSet<String> = std::collections::HashSet::new();

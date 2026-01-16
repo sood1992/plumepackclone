@@ -868,8 +868,7 @@ impl ProjectParser {
             for (clip_id, media_uid) in clip_to_media {
                 if let Some(objs) = state.objects_by_id.get(clip_id) {
                     for obj in objs {
-                        // Extract time points from clip object
-                        // Premiere stores these as child elements: Start, End, InPoint, OutPoint
+                        // Get timeline position from track item
                         let start_ticks = obj.children.get("Start")
                             .and_then(|v| v.first())
                             .and_then(|s| s.parse::<i64>().ok())
@@ -878,33 +877,24 @@ impl ProjectParser {
                             .and_then(|v| v.first())
                             .and_then(|s| s.parse::<i64>().ok())
                             .unwrap_or(0);
-                        let in_point_ticks = obj.children.get("InPoint")
-                            .and_then(|v| v.first())
-                            .and_then(|s| s.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        let out_point_ticks = obj.children.get("OutPoint")
-                            .and_then(|v| v.first())
-                            .and_then(|s| s.parse::<i64>().ok())
-                            .unwrap_or(0);
 
-                        // If OutPoint is 0 but we have End, calculate OutPoint from timeline duration
-                        let out_point_ticks = if out_point_ticks == 0 && end_ticks > start_ticks {
-                            in_point_ticks + (end_ticks - start_ticks)
-                        } else {
-                            out_point_ticks
-                        };
+                        // InPoint/OutPoint are NOT on the track item - they're on the Clip object
+                        // Reference chain: TrackItem -> SubClip -> Clip
+                        // We need to follow this chain to get the source media in/out points
+                        let (in_point_ticks, out_point_ticks) = self.get_clip_in_out_points(
+                            clip_id, state, end_ticks - start_ticks
+                        );
 
                         // Log the first few clips for debugging
                         if found_video + found_audio < 3 {
                             const TICKS_PER_SEC: f64 = 254016000000.0;
                             tracing::debug!(
-                                "Clip {}: in={:.2}s out={:.2}s (ticks: {} - {}), children: {:?}",
+                                "Clip {}: timeline={:.2}s-{:.2}s, source in={:.2}s out={:.2}s",
                                 clip_id,
+                                start_ticks as f64 / TICKS_PER_SEC,
+                                end_ticks as f64 / TICKS_PER_SEC,
                                 in_point_ticks as f64 / TICKS_PER_SEC,
                                 out_point_ticks as f64 / TICKS_PER_SEC,
-                                in_point_ticks,
-                                out_point_ticks,
-                                obj.children.keys().collect::<Vec<_>>()
                             );
                         }
 
@@ -1027,6 +1017,56 @@ impl ProjectParser {
                 }
             }
         }
+    }
+
+    /// Follow reference chain from TrackItem -> SubClip -> Clip to get InPoint/OutPoint
+    /// The track item only has timeline position (Start/End), not source media times.
+    /// Returns (in_point_ticks, out_point_ticks) from the Clip object.
+    fn get_clip_in_out_points(
+        &self,
+        track_item_id: &str,
+        state: &ParserState,
+        timeline_duration: i64,
+    ) -> (i64, i64) {
+        // Follow: TrackItem -> SubClip ref -> Clip ref -> InPoint/OutPoint
+        if let Some(refs) = state.refs_from_id.get(track_item_id) {
+            for (ref_tag, target_id, _is_guid) in refs {
+                if ref_tag == "SubClip" {
+                    // Found SubClip reference, now follow to Clip
+                    if let Some(subclip_refs) = state.refs_from_id.get(target_id) {
+                        for (ref_tag2, clip_id, _) in subclip_refs {
+                            if ref_tag2 == "Clip" {
+                                // Found Clip reference, get InPoint/OutPoint from it
+                                if let Some(clip_objs) = state.objects_by_id.get(clip_id) {
+                                    for clip_obj in clip_objs {
+                                        let in_point = clip_obj.children.get("InPoint")
+                                            .and_then(|v| v.first())
+                                            .and_then(|s| s.parse::<i64>().ok())
+                                            .unwrap_or(0);
+                                        let out_point = clip_obj.children.get("OutPoint")
+                                            .and_then(|v| v.first())
+                                            .and_then(|s| s.parse::<i64>().ok())
+                                            .unwrap_or(0);
+
+                                        if out_point > in_point {
+                                            return (in_point, out_point);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: if we couldn't find via ref chain, use timeline duration
+        // This assumes the whole clip is used starting from 0
+        if timeline_duration > 0 {
+            return (0, timeline_duration);
+        }
+
+        (0, 0)
     }
 
     fn parse_bin_from_obj(&self, id: &str, obj: &XmlObject) -> Option<Bin> {
