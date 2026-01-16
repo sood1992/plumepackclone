@@ -427,15 +427,42 @@ impl ProjectParser {
     }
 
     fn parse_media_file(&self, id: &str, obj: &XmlObject) -> Option<MediaFile> {
-        // Try to find the file path in various locations
+        // Debug: log what's in the media source object
+        tracing::info!("Parsing media source {} ({}), attributes: {:?}", id, obj.tag, obj.attributes.keys().collect::<Vec<_>>());
+        tracing::info!("Media source {} children keys: {:?}", id, obj.children.keys().take(10).collect::<Vec<_>>());
+
+        // Try to find the file path in various locations used by Premiere Pro
         let file_path = obj
             .children
             .get("FilePath")
             .or_else(|| obj.children.get("Media/FilePath"))
             .or_else(|| obj.children.get("ActualMediaFilePath"))
+            .or_else(|| obj.children.get("MediaFilePath"))
+            .or_else(|| obj.children.get("VideoMediaSource/FilePath"))
+            .or_else(|| obj.children.get("AudioMediaSource/FilePath"))
+            .or_else(|| obj.children.get("ImporterPrefs/MediaFilePath"))
             .and_then(|v| v.first())
             .map(|s| PathBuf::from(s))
-            .or_else(|| obj.attributes.get("FilePath").map(|s| PathBuf::from(s)))?;
+            .or_else(|| obj.attributes.get("FilePath").map(|s| PathBuf::from(s)))
+            .or_else(|| obj.attributes.get("MediaFilePath").map(|s| PathBuf::from(s)));
+
+        // Log if we found a path or not
+        if let Some(ref path) = file_path {
+            tracing::info!("Found file path for {}: {:?}", id, path);
+        } else {
+            tracing::warn!("No file path found for media source {}", id);
+            // Try to find any child that looks like a path
+            for (key, values) in &obj.children {
+                if let Some(val) = values.first() {
+                    if val.contains("/") || val.contains("\\") || val.contains(".") {
+                        tracing::info!("  Potential path in {}: {}", key, val);
+                    }
+                }
+            }
+            return None;
+        }
+
+        let file_path = file_path?;
 
         let ext = file_path
             .extension()
