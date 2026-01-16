@@ -340,22 +340,11 @@ impl ProjectParser {
 
         for (id, obj) in objects {
             match obj.tag.as_str() {
-                // Premiere Pro uses various sequence-related tags
-                "Sequence" | "VideoSequence" => {
+                // Premiere Pro uses VideoSequenceSource for sequences
+                "VideoSequenceSource" => {
                     if let Some(sequence) = self.parse_sequence(id, obj, objects) {
                         tracing::info!("Found sequence: {} ({})", sequence.name, id);
                         project.sequences.push(sequence);
-                    }
-                }
-                "MasterClip" => {
-                    // MasterClip can be a sequence or media reference - check for timeline properties
-                    if obj.children.contains_key("VideoTracks") || obj.children.contains_key("AudioTracks") {
-                        if let Some(sequence) = self.parse_sequence(id, obj, objects) {
-                            tracing::info!("Found sequence from MasterClip: {} ({})", sequence.name, id);
-                            project.sequences.push(sequence);
-                        }
-                    } else if let Some(media) = self.parse_media_file(id, obj) {
-                        project.media_files.insert(id.clone(), media);
                     }
                 }
                 "Bin" | "BinProjectItem" | "RootProjectItem" => {
@@ -363,16 +352,13 @@ impl ProjectParser {
                         project.bins.push(bin);
                     }
                 }
-                "MediaFile" | "Media" => {
+                // Media sources - these contain file paths
+                "VideoMediaSource" | "AudioMediaSource" => {
                     if let Some(media) = self.parse_media_file(id, obj) {
                         project.media_files.insert(id.clone(), media);
                     }
                 }
-                "ClipProjectItem" | "ProjectItem" => {
-                    // Try to extract media file reference
-                    if let Some(media) = self.parse_media_file(id, obj) {
-                        project.media_files.insert(id.clone(), media);
-                    }
+                "ClipProjectItem" | "ProjectItem" | "SubClip" => {
                     if let Some(item) = self.parse_project_item(id, obj) {
                         project.project_items.insert(id.clone(), item);
                     }
@@ -391,18 +377,23 @@ impl ProjectParser {
         &self,
         id: &str,
         obj: &XmlObject,
-        objects: &HashMap<String, XmlObject>,
+        _objects: &HashMap<String, XmlObject>,
     ) -> Option<Sequence> {
+        // Debug: log attributes and children keys for first sequence
+        tracing::debug!("VideoSequenceSource {} attributes: {:?}", id, obj.attributes);
+        tracing::debug!("VideoSequenceSource {} children keys: {:?}", id, obj.children.keys().collect::<Vec<_>>());
+
+        // Try various attribute/child names for the sequence name
         let name = obj
             .attributes
             .get("Name")
-            .or_else(|| {
-                obj.children
-                    .get("Name")
-                    .and_then(|v| v.first())
-            })
+            .or_else(|| obj.attributes.get("ObjectName"))
+            .or_else(|| obj.children.get("Name").and_then(|v| v.first()))
+            .or_else(|| obj.children.get("VideoSequenceSource/Name").and_then(|v| v.first()))
             .cloned()
             .unwrap_or_else(|| format!("Sequence {}", id));
+
+        tracing::info!("Parsed sequence name: {}", name);
 
         Some(Sequence {
             object_id: id.to_string(),
