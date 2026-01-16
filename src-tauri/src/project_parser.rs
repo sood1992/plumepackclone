@@ -621,53 +621,16 @@ impl ProjectParser {
             .collect();
         tracing::info!("Found {} clip track items (by ID)", clip_items.len());
 
-        // Track which media UIDs are used by clips
-        let mut used_media_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Build clip_id -> media_uid mapping
+        let mut clip_to_media: HashMap<String, String> = HashMap::new();
 
-        // For each clip track item, follow the reference chain to find media
-        let mut clips_with_refs = 0;
-        let mut clips_without_refs = 0;
-        let mut clips_resolved_to_media = 0;
-
-        for (clip_id, clip_obj) in &clip_items {
-            // Check if this clip has any refs at all
-            let refs_by_id = state.refs_from_id.get(*clip_id);
-            let refs_by_uid = state.refs_from_uid.get(*clip_id);
-            let has_refs = refs_by_id.is_some() || refs_by_uid.is_some();
-
-            if !has_refs {
-                clips_without_refs += 1;
-                if clips_without_refs <= 3 {
-                    tracing::warn!("Clip {} ({}) has NO refs! attrs: {:?}",
-                        clip_id, clip_obj.tag, clip_obj.attributes.keys().collect::<Vec<_>>());
-                }
-            } else {
-                clips_with_refs += 1;
-                // Log the refs for first few clips
-                if clips_with_refs <= 3 {
-                    if let Some(refs) = refs_by_id {
-                        tracing::info!("Clip {} refs from ID: {:?}", clip_id, refs);
-                    }
-                    if let Some(refs) = refs_by_uid {
-                        tracing::info!("Clip {} refs from UID: {:?}", clip_id, refs);
-                    }
-                }
-            }
-
+        for (clip_id, _clip_obj) in &clip_items {
             if let Some(media_uid) = self.find_media_for_clip(clip_id, state, 0) {
-                clips_resolved_to_media += 1;
-                if clips_resolved_to_media <= 5 {
-                    tracing::info!("SUCCESS: Clip {} -> Media {}", clip_id, media_uid);
-                }
-                used_media_uids.insert(media_uid);
+                clip_to_media.insert(clip_id.to_string(), media_uid);
             }
         }
 
-        tracing::info!("Clip summary: {} with refs, {} without refs, {} resolved to media",
-            clips_with_refs, clips_without_refs, clips_resolved_to_media);
-
-        tracing::info!("Clips with refs: {}, without refs: {}", clips_with_refs, clips_without_refs);
-        tracing::info!("Found {} unique media files used by clips", used_media_uids.len());
+        tracing::info!("Resolved {} clips to media", clip_to_media.len());
 
         // Process sequences - ONLY real Sequence objects with correct ClassID
         // Real Sequence ClassID: 6a15d903-8739-11d5-af2d-9b7855ad8974
@@ -678,7 +641,9 @@ impl ProjectParser {
                 // Check ClassID to filter out non-sequences
                 let class_id = obj.attributes.get("ClassID").map(|s| s.as_str()).unwrap_or("");
                 if class_id == SEQUENCE_CLASS_ID {
-                    if let Some(sequence) = self.parse_sequence_from_obj(uid, obj) {
+                    if let Some(mut sequence) = self.parse_sequence_from_obj(uid, obj) {
+                        // Populate tracks by finding clips that belong to this sequence
+                        self.populate_sequence_tracks(&mut sequence, uid, state, &clip_to_media);
                         project.sequences.push(sequence);
                     }
                 } else {
@@ -828,8 +793,8 @@ impl ProjectParser {
         };
 
         // Log what we found for debugging
-        tracing::info!("Sequence '{}' ({}): MZ.OutPoint={}, duration={:.1}s, children: {:?}",
-            name, id, duration_ticks, duration_seconds, obj.children.keys().collect::<Vec<_>>());
+        tracing::info!("Sequence '{}' ({}): MZ.OutPoint={}, duration={:.1}s",
+            name, id, duration_ticks, duration_seconds);
 
         Some(Sequence {
             object_id: id.to_string(),
@@ -843,6 +808,135 @@ impl ProjectParser {
             audio_tracks: Vec::new(),
             nested_sequences: Vec::new(),
         })
+    }
+
+    /// Populate sequence tracks by following the reference chain from sequence to clips
+    fn populate_sequence_tracks(
+        &self,
+        sequence: &mut Sequence,
+        sequence_uid: &str,
+        state: &ParserState,
+        clip_to_media: &HashMap<String, String>,
+    ) {
+        // Find all clips that belong to this sequence by following the reference chain:
+        // Sequence -> VideoTracks/AudioTracks -> Track -> ClipItems -> ClipTrackItem
+
+        let mut video_clips: Vec<TrackClip> = Vec::new();
+        let mut audio_clips: Vec<TrackClip> = Vec::new();
+
+        // Get refs from this sequence (by UID)
+        if let Some(seq_refs) = state.refs_from_uid.get(sequence_uid) {
+            for (ref_tag, target, is_guid) in seq_refs {
+                // Look for VideoTracks and AudioTracks references
+                if ref_tag == "VideoTracks" || ref_tag == "AudioTracks" {
+                    let is_video = ref_tag == "VideoTracks";
+                    // Follow to find tracks
+                    self.find_clips_in_tracks(target, *is_guid, is_video, state, clip_to_media,
+                        if is_video { &mut video_clips } else { &mut audio_clips });
+                }
+            }
+        }
+
+        // Also check refs by ID (some sequences might use ID)
+        if let Some(seq_refs) = state.refs_from_id.get(sequence_uid) {
+            for (ref_tag, target, is_guid) in seq_refs {
+                if ref_tag == "VideoTracks" || ref_tag == "AudioTracks" {
+                    let is_video = ref_tag == "VideoTracks";
+                    self.find_clips_in_tracks(target, *is_guid, is_video, state, clip_to_media,
+                        if is_video { &mut video_clips } else { &mut audio_clips });
+                }
+            }
+        }
+
+        // Create a single track for each type with all clips
+        if !video_clips.is_empty() {
+            sequence.video_tracks.push(Track {
+                object_id: format!("{}_video", sequence_uid),
+                name: "Video".to_string(),
+                track_type: TrackType::Video,
+                clips: video_clips,
+            });
+        }
+
+        if !audio_clips.is_empty() {
+            sequence.audio_tracks.push(Track {
+                object_id: format!("{}_audio", sequence_uid),
+                name: "Audio".to_string(),
+                track_type: TrackType::Audio,
+                clips: audio_clips,
+            });
+        }
+
+        tracing::info!("Sequence '{}': {} video clips, {} audio clips",
+            sequence.name,
+            sequence.video_tracks.iter().map(|t| t.clips.len()).sum::<usize>(),
+            sequence.audio_tracks.iter().map(|t| t.clips.len()).sum::<usize>());
+    }
+
+    /// Recursively find clips within tracks container
+    fn find_clips_in_tracks(
+        &self,
+        target_id: &str,
+        is_guid: bool,
+        is_video: bool,
+        state: &ParserState,
+        clip_to_media: &HashMap<String, String>,
+        clips: &mut Vec<TrackClip>,
+    ) {
+        // Get refs from this object to find nested tracks or clips
+        let refs = if is_guid {
+            state.refs_from_uid.get(target_id)
+        } else {
+            state.refs_from_id.get(target_id)
+        };
+
+        if let Some(refs) = refs {
+            for (ref_tag, nested_target, nested_is_guid) in refs {
+                // Look for Track references or ClipItems
+                if ref_tag.contains("Track") || ref_tag == "ClipItems" {
+                    self.find_clips_in_tracks(nested_target, *nested_is_guid, is_video, state, clip_to_media, clips);
+                }
+                // Look for actual clip track items
+                if ref_tag == "VideoClipTrackItem" || ref_tag == "AudioClipTrackItem" {
+                    if let Some(media_uid) = clip_to_media.get(nested_target) {
+                        clips.push(TrackClip {
+                            object_id: nested_target.clone(),
+                            name: String::new(),
+                            start_ticks: 0,
+                            end_ticks: 0,
+                            in_point_ticks: 0,
+                            out_point_ticks: 0,
+                            media_ref: Some(media_uid.clone()),
+                            clip_type: ClipType::Standard,
+                            speed: 1.0,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Also check if target_id itself is a clip
+        if let Some(media_uid) = clip_to_media.get(target_id) {
+            // Check if this ID corresponds to a clip track item
+            if let Some(objs) = state.objects_by_id.get(target_id) {
+                for obj in objs {
+                    if obj.tag == "VideoClipTrackItem" || obj.tag == "AudioClipTrackItem" {
+                        clips.push(TrackClip {
+                            object_id: target_id.to_string(),
+                            name: String::new(),
+                            start_ticks: 0,
+                            end_ticks: 0,
+                            in_point_ticks: 0,
+                            out_point_ticks: 0,
+                            media_ref: Some(media_uid.clone()),
+                            clip_type: ClipType::Standard,
+                            speed: 1.0,
+                        });
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fn parse_bin_from_obj(&self, id: &str, obj: &XmlObject) -> Option<Bin> {
