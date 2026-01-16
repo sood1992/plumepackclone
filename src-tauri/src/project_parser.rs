@@ -559,13 +559,27 @@ impl ProjectParser {
         let mut used_media_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // For each clip track item, follow the reference chain to find media
+        let mut clips_with_refs = 0;
+        let mut clips_without_refs = 0;
         for (clip_id, _clip_obj) in &clip_items_by_id {
+            // Check if this clip has any refs at all
+            let has_refs = state.refs_from_id.contains_key(*clip_id) || state.refs_from_uid.contains_key(*clip_id);
+            if !has_refs {
+                clips_without_refs += 1;
+                if clips_without_refs <= 3 {
+                    tracing::warn!("Clip {} has NO refs!", clip_id);
+                }
+            } else {
+                clips_with_refs += 1;
+            }
+
             if let Some(media_uid) = self.find_media_for_clip(clip_id, state, 0) {
                 tracing::debug!("Clip {} -> Media {}", clip_id, media_uid);
                 used_media_uids.insert(media_uid);
             }
         }
 
+        tracing::info!("Clips with refs: {}, without refs: {}", clips_with_refs, clips_without_refs);
         tracing::info!("Found {} unique media files used by clips", used_media_uids.len());
 
         // Process sequences (they use ObjectUID)
@@ -663,14 +677,25 @@ impl ProjectParser {
     }
 
     fn parse_sequence_from_obj(&self, id: &str, obj: &XmlObject) -> Option<Sequence> {
-        // Try various attribute/child names for the sequence name
+        // Try various ways to find the sequence name
+        // Premiere stores names in <n> element or Name attribute
         let name = obj
             .attributes
             .get("Name")
             .or_else(|| obj.attributes.get("ObjectName"))
             .or_else(|| obj.children.get("Name").and_then(|v| v.first()))
+            // Try looking for any child path ending in /n (like "Sequence/n" or just "n")
+            .or_else(|| {
+                obj.children.iter()
+                    .find(|(path, _)| path.ends_with("/n") || *path == "n")
+                    .and_then(|(_, v)| v.first())
+            })
             .cloned()
             .unwrap_or_else(|| format!("Sequence {}", id));
+
+        // Log what we found for debugging
+        tracing::debug!("Sequence {} name: '{}', children keys: {:?}",
+            id, name, obj.children.keys().take(5).collect::<Vec<_>>());
 
         Some(Sequence {
             object_id: id.to_string(),
