@@ -868,13 +868,53 @@ impl ProjectParser {
             for (clip_id, media_uid) in clip_to_media {
                 if let Some(objs) = state.objects_by_id.get(clip_id) {
                     for obj in objs {
+                        // Extract time points from clip object
+                        // Premiere stores these as child elements: Start, End, InPoint, OutPoint
+                        let start_ticks = obj.children.get("Start")
+                            .and_then(|v| v.first())
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        let end_ticks = obj.children.get("End")
+                            .and_then(|v| v.first())
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        let in_point_ticks = obj.children.get("InPoint")
+                            .and_then(|v| v.first())
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        let out_point_ticks = obj.children.get("OutPoint")
+                            .and_then(|v| v.first())
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(0);
+
+                        // If OutPoint is 0 but we have End, calculate OutPoint from timeline duration
+                        let out_point_ticks = if out_point_ticks == 0 && end_ticks > start_ticks {
+                            in_point_ticks + (end_ticks - start_ticks)
+                        } else {
+                            out_point_ticks
+                        };
+
+                        // Log the first few clips for debugging
+                        if found_video + found_audio < 3 {
+                            const TICKS_PER_SEC: f64 = 254016000000.0;
+                            tracing::debug!(
+                                "Clip {}: in={:.2}s out={:.2}s (ticks: {} - {}), children: {:?}",
+                                clip_id,
+                                in_point_ticks as f64 / TICKS_PER_SEC,
+                                out_point_ticks as f64 / TICKS_PER_SEC,
+                                in_point_ticks,
+                                out_point_ticks,
+                                obj.children.keys().collect::<Vec<_>>()
+                            );
+                        }
+
                         let clip = TrackClip {
                             object_id: clip_id.clone(),
                             name: String::new(),
-                            start_ticks: 0,
-                            end_ticks: 0,
-                            in_point_ticks: 0,
-                            out_point_ticks: 0,
+                            start_ticks,
+                            end_ticks,
+                            in_point_ticks,
+                            out_point_ticks,
                             media_ref: Some(media_uid.clone()),
                             clip_type: ClipType::Standard,
                             speed: 1.0,
