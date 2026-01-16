@@ -300,23 +300,24 @@ impl ProjectParser {
                     state.current_text = e.unescape().unwrap_or_default().to_string();
 
                     // Check if current element is a file path element (based on Premiere XML structure)
+                    // Prefer absolute path elements over relative ones
                     let current_tag = state.current_element.last().map(|s| s.as_str()).unwrap_or("");
-                    let is_file_path_element = matches!(current_tag,
-                        "ActualMediaFilePath" | "FilePath" | "MediaFilePath" |
-                        "RelativePath" | "MediaFileHistory"
+                    let is_absolute_path_element = matches!(current_tag,
+                        "ActualMediaFilePath" | "FilePath" | "MediaFilePath"
                     );
 
-                    // Check if the content looks like an actual file path
+                    // Check if the content looks like an actual ABSOLUTE file path
                     let text = &state.current_text;
+                    let is_absolute_path = text.starts_with('/') ||
+                        (text.len() > 2 && text.chars().nth(1) == Some(':'));  // Windows C:\
+
                     let looks_like_path = text.len() > 5 &&
-                        (text.contains('/') || text.contains('\\')) &&
+                        is_absolute_path &&  // Only accept absolute paths
                         // Exclude cache/temp files
                         !text.contains("Peak Files") &&
                         !text.contains("Audio Previews") &&
                         !text.ends_with(".pek") &&
-                        !text.ends_with(".cfa") &&
-                        // Must not be just a number
-                        !text.chars().all(|c| c.is_ascii_digit());
+                        !text.ends_with(".cfa");
 
                     // Check for valid media extensions
                     let text_lower = text.to_lowercase();
@@ -333,8 +334,8 @@ impl ProjectParser {
                         text_lower.ends_with(".prproj") || text_lower.ends_with(".gif") ||
                         text_lower.ends_with(".webm") || text_lower.ends_with(".mkv");
 
-                    // Store if it's a file path element with valid content
-                    if is_file_path_element && looks_like_path && has_media_extension {
+                    // Store if it's an absolute file path element with valid content
+                    if is_absolute_path_element && looks_like_path && has_media_extension {
                         let parent_id = state.current_object_id.clone().unwrap_or_else(|| "unknown".to_string());
                         tracing::info!("Found media file path in {}: {} (parent: {})", current_tag, text, parent_id);
                         file_paths.push((parent_id, PathBuf::from(text.clone())));
