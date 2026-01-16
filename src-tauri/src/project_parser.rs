@@ -180,14 +180,18 @@ struct ParserState {
     objects: HashMap<String, XmlObject>,
     current_object_id: Option<String>,
     current_text: String,
+    /// Object references: source_id -> Vec<(ref_type, target_id)>
+    object_refs: HashMap<String, Vec<(String, String)>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct XmlObject {
     tag: String,
     attributes: HashMap<String, String>,
     children: HashMap<String, Vec<String>>,
     text_content: Option<String>,
+    /// Direct child ObjectRefs
+    refs: Vec<(String, String)>, // (ref_element_name, target_id)
 }
 
 /// Main parser for .prproj files
@@ -248,6 +252,7 @@ impl ProjectParser {
             objects: HashMap::new(),
             current_object_id: None,
             current_text: String::new(),
+            object_refs: HashMap::new(),
         };
 
         // Separate storage for file paths found anywhere in the XML
@@ -261,23 +266,43 @@ impl ProjectParser {
                     let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                     state.current_element.push(tag_name.clone());
 
-                    // Extract ObjectID if present
+                    let mut object_ref_target: Option<String> = None;
+
+                    // Extract ObjectID and ObjectRef if present
                     for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"ObjectID" {
-                            let id = String::from_utf8_lossy(&attr.value).to_string();
-                            state.current_object_id = Some(id.clone());
+                        let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                        let value = String::from_utf8_lossy(&attr.value).to_string();
+
+                        if key == "ObjectID" {
+                            state.current_object_id = Some(value.clone());
 
                             let mut obj = XmlObject::default();
                             obj.tag = tag_name.clone();
 
                             // Store all attributes
-                            for attr in e.attributes().flatten() {
-                                let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                                let value = String::from_utf8_lossy(&attr.value).to_string();
-                                obj.attributes.insert(key, value);
+                            for attr2 in e.attributes().flatten() {
+                                let k = String::from_utf8_lossy(attr2.key.as_ref()).to_string();
+                                let v = String::from_utf8_lossy(&attr2.value).to_string();
+                                obj.attributes.insert(k, v);
                             }
 
-                            state.objects.insert(id, obj);
+                            state.objects.insert(value, obj);
+                        } else if key == "ObjectRef" || key == "ObjectURef" {
+                            // This element references another object
+                            object_ref_target = Some(value);
+                        }
+                    }
+
+                    // If this element is a reference to another object, store the relationship
+                    if let (Some(ref parent_id), Some(ref target_id)) = (&state.current_object_id, &object_ref_target) {
+                        state.object_refs
+                            .entry(parent_id.clone())
+                            .or_default()
+                            .push((tag_name.clone(), target_id.clone()));
+
+                        // Also store in the object's refs
+                        if let Some(obj) = state.objects.get_mut(parent_id) {
+                            obj.refs.push((tag_name.clone(), target_id.clone()));
                         }
                     }
 
@@ -391,7 +416,15 @@ impl ProjectParser {
         }
 
         // Process parsed objects into structured data
-        self.process_objects(&state.objects, &mut project)?;
+        self.process_objects(&state.objects, &state.object_refs, &mut project)?;
+
+        // Log summary
+        tracing::info!(
+            "Parsed project: {} sequences, {} media files, {} refs tracked",
+            project.sequences.len(),
+            project.media_files.len(),
+            state.object_refs.len()
+        );
 
         Ok(project)
     }
@@ -400,11 +433,38 @@ impl ProjectParser {
     fn process_objects(
         &self,
         objects: &HashMap<String, XmlObject>,
+        object_refs: &HashMap<String, Vec<(String, String)>>,
         project: &mut PremiereProject,
     ) -> Result<()> {
+        // First, collect all clip track items and their media references
+        let mut clip_to_media: HashMap<String, String> = HashMap::new();
+
+        // Find VideoClipTrackItem and AudioClipTrackItem, trace their media references
+        for (id, obj) in objects {
+            if obj.tag == "VideoClipTrackItem" || obj.tag == "AudioClipTrackItem" {
+                // Follow references to find the actual media
+                if let Some(media_id) = self.find_media_reference(id, objects, object_refs, 0) {
+                    clip_to_media.insert(id.clone(), media_id);
+                }
+            }
+        }
+
+        tracing::info!("Found {} clip-to-media mappings", clip_to_media.len());
+
+        // Now mark media files that are referenced by clips as "used"
+        // Store which media IDs are used
+        let used_media_ids: std::collections::HashSet<String> = clip_to_media.values().cloned().collect();
+
+        // Update media files to mark usage (we'll use this in the analyzer)
+        for media_id in &used_media_ids {
+            if project.media_files.contains_key(media_id) {
+                tracing::debug!("Media {} is used in clips", media_id);
+            }
+        }
+
+        // Process sequences
         for (id, obj) in objects {
             match obj.tag.as_str() {
-                // Premiere Pro uses VideoSequenceSource for sequences
                 "VideoSequenceSource" => {
                     if let Some(sequence) = self.parse_sequence(id, obj, objects) {
                         project.sequences.push(sequence);
@@ -427,7 +487,58 @@ impl ProjectParser {
         // Build bin paths
         self.build_bin_paths(&mut project.bins);
 
+        // Store clip_to_media mapping for the analyzer to use
+        // We'll do this by marking which object IDs have media associated
+        // For now, mark all media files found in the project as potentially used
+        // since we have the file paths
+
         Ok(())
+    }
+
+    /// Follow ObjectRef chain to find the actual media file
+    fn find_media_reference(
+        &self,
+        start_id: &str,
+        objects: &HashMap<String, XmlObject>,
+        object_refs: &HashMap<String, Vec<(String, String)>>,
+        depth: usize,
+    ) -> Option<String> {
+        if depth > 10 {
+            return None; // Prevent infinite loops
+        }
+
+        // Check if this object has references
+        if let Some(refs) = object_refs.get(start_id) {
+            for (ref_type, target_id) in refs {
+                // Check if target is a media file (has a file path associated)
+                if let Some(target_obj) = objects.get(target_id) {
+                    // VideoMediaSource and AudioMediaSource are media containers
+                    if target_obj.tag == "VideoMediaSource" || target_obj.tag == "AudioMediaSource" {
+                        return Some(target_id.clone());
+                    }
+
+                    // VideoClip and AudioClip might reference media
+                    if target_obj.tag == "VideoClip" || target_obj.tag == "AudioClip" {
+                        // Recursively search from the clip
+                        if let Some(media_id) = self.find_media_reference(target_id, objects, object_refs, depth + 1) {
+                            return Some(media_id);
+                        }
+                    }
+
+                    // VideoStream and AudioStream might be the actual media
+                    if target_obj.tag == "VideoStream" || target_obj.tag == "AudioStream" {
+                        return Some(target_id.clone());
+                    }
+
+                    // Continue following the chain for other types
+                    if let Some(media_id) = self.find_media_reference(target_id, objects, object_refs, depth + 1) {
+                        return Some(media_id);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     fn parse_sequence(
