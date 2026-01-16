@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use crate::project_parser::{ClipType, PremiereProject, Sequence, TrackClip};
+use crate::project_parser::{ClipType, PremiereProject, TrackClip};
 
 /// Analysis result for media usage in project
 #[derive(Debug, Clone, Serialize, Deserialize)]

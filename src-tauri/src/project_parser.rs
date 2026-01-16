@@ -485,9 +485,10 @@ impl ProjectParser {
     }
 
     fn build_bin_paths(&self, bins: &mut [Bin]) {
-        let bin_map: HashMap<String, String> = bins
+        // Store both name and parent_id for each bin
+        let bin_info: HashMap<String, (String, Option<String>)> = bins
             .iter()
-            .map(|b| (b.object_id.clone(), b.name.clone()))
+            .map(|b| (b.object_id.clone(), (b.name.clone(), b.parent_id.clone())))
             .collect();
 
         for bin in bins.iter_mut() {
@@ -495,13 +496,10 @@ impl ProjectParser {
             let mut current_parent = bin.parent_id.clone();
 
             while let Some(parent_id) = current_parent {
-                if let Some(parent_name) = bin_map.get(&parent_id) {
+                if let Some((parent_name, grandparent_id)) = bin_info.get(&parent_id) {
                     path_parts.insert(0, parent_name.clone());
-                    // Find parent's parent
-                    current_parent = bins
-                        .iter()
-                        .find(|b| b.object_id == parent_id)
-                        .and_then(|b| b.parent_id.clone());
+                    // Get parent's parent from the map
+                    current_parent = grandparent_id.clone();
                 } else {
                     break;
                 }

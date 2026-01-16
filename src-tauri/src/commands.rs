@@ -3,7 +3,7 @@
 //! These commands are exposed to the React frontend via Tauri's IPC.
 
 use crate::consolidation::{
-    ConsolidationConfig, ConsolidationEngine, ConsolidationProgress, ConsolidationStatus,
+    ConsolidationConfig, ConsolidationEngine, ConsolidationProgress,
     FolderStructure, OptimizationMode, ProcessingModeConfig, ProxyMode,
 };
 use crate::ffmpeg::{FFmpeg, MediaMetadata, TranscodePreset};
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use tauri::State;
 
 /// Premiere ticks per second constant
@@ -382,7 +382,6 @@ pub async fn start_consolidation(
     // Run in background thread
     let engine_clone = engine_arc.clone();
     let job_id_clone = job_id.clone();
-    let state_jobs = state.running_jobs.clone();
 
     std::thread::spawn(move || {
         let result = engine_clone.run();

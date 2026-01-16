@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-use crate::ffmpeg::{FFmpeg, ProcessingMode, TranscodePreset};
-use crate::media_scanner::{compute_partial_hash, MediaInventory, MediaScanner};
+use crate::ffmpeg::{FFmpeg, TranscodePreset};
+use crate::media_scanner::{MediaInventory, MediaScanner};
 use crate::project_parser::{get_sidecar_files, MediaFile, PremiereProject, ProjectParser};
 use crate::sequence_analyzer::{
     find_common_ancestor, optimize_time_ranges, MediaUsageAnalysis, SequenceAnalyzer, TimeRange,

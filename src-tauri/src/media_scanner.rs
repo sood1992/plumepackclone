@@ -5,10 +5,9 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::project_parser::{get_sidecar_files, MediaFile, MediaType, PremiereProject};
@@ -133,7 +132,7 @@ impl<'a> MediaScanner<'a> {
             .project
             .project_items
             .values()
-            .find(|item| item.media_ref.as_ref() == Some(id))
+            .find(|item| item.media_ref.as_ref().map(|s| s.as_str()) == Some(id))
             .and_then(|item| item.bin_id.as_ref())
             .and_then(|bin_id| {
                 self.project
