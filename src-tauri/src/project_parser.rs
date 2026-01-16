@@ -409,9 +409,10 @@ impl ProjectParser {
         tracing::info!("  - Media file paths: {}", state.media_file_paths.len());
 
         // Log sample refs from numeric IDs
+        let sample_refs: Vec<_> = state.refs_from_id.iter().take(5).collect();
         if !sample_refs.is_empty() {
             tracing::info!("Sample refs from numeric IDs:");
-            for (parent_id, refs) in sample_refs.iter().take(5) {
+            for (parent_id, refs) in &sample_refs {
                 for (tag, target, is_guid) in refs.iter().take(3) {
                     tracing::info!("  {} --{}--> {} (guid:{})", parent_id, tag, target, is_guid);
                 }
