@@ -187,10 +187,9 @@ struct ParserState {
     objects_by_id: HashMap<String, Vec<XmlObject>>,
     /// Objects indexed by GUID ObjectUID (GUIDs are unique, no collision)
     objects_by_uid: HashMap<String, XmlObject>,
-    /// Current numeric ObjectID context
-    current_object_id: Option<String>,
-    /// Current GUID ObjectUID context
-    current_object_uid: Option<String>,
+    /// Stack of object contexts - tracks (ObjectID, ObjectUID) for each nested element
+    /// This is CRITICAL: references must be associated with the IMMEDIATE parent, not ancestors
+    object_context_stack: Vec<(Option<String>, Option<String>)>,
     current_text: String,
     /// References from numeric ObjectID: source_id -> Vec<(element_tag, target_id, is_guid_ref)>
     refs_from_id: HashMap<String, Vec<(String, String, bool)>>,
@@ -198,6 +197,41 @@ struct ParserState {
     refs_from_uid: HashMap<String, Vec<(String, String, bool)>>,
     /// Media objects (have file paths) indexed by their ObjectUID
     media_file_paths: HashMap<String, PathBuf>,
+}
+
+impl ParserState {
+    /// Get the current object context (the most recent ObjectID/ObjectUID from the stack)
+    fn current_context(&self) -> (Option<String>, Option<String>) {
+        // Find the most recent element with an ObjectID or ObjectUID
+        for (obj_id, obj_uid) in self.object_context_stack.iter().rev() {
+            if obj_id.is_some() || obj_uid.is_some() {
+                return (obj_id.clone(), obj_uid.clone());
+            }
+        }
+        (None, None)
+    }
+
+    /// Get the current object ID (preferring the most immediate context)
+    fn current_object_id(&self) -> Option<String> {
+        // Search from most recent first - find the closest ancestor with an ID
+        for (obj_id, _) in self.object_context_stack.iter().rev() {
+            if obj_id.is_some() {
+                return obj_id.clone();
+            }
+        }
+        None
+    }
+
+    /// Get the current object UID (preferring the most immediate context)
+    fn current_object_uid(&self) -> Option<String> {
+        // Search from most recent first - find the closest ancestor with a UID
+        for (_, obj_uid) in self.object_context_stack.iter().rev() {
+            if obj_uid.is_some() {
+                return obj_uid.clone();
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -267,8 +301,7 @@ impl ProjectParser {
             current_element: Vec::new(),
             objects_by_id: HashMap::new(),  // Vec per ID to handle collisions
             objects_by_uid: HashMap::new(),
-            current_object_id: None,
-            current_object_uid: None,
+            object_context_stack: Vec::new(),  // Track nested object contexts
             current_text: String::new(),
             refs_from_id: HashMap::new(),
             refs_from_uid: HashMap::new(),
@@ -309,6 +342,7 @@ impl ProjectParser {
                 }
                 Ok(Event::End(_)) => {
                     state.current_element.pop();
+                    state.object_context_stack.pop();  // Pop the context for this element
                     state.current_text.clear();
                 }
                 Ok(Event::Empty(e)) => {
@@ -368,9 +402,9 @@ impl ProjectParser {
 
                     // Store file path - Media objects use ObjectUID (GUID) as their identifier
                     if is_file_path_element && looks_like_path && has_media_extension {
-                        // Prefer ObjectUID (GUID) for Media objects
-                        let parent_uid = state.current_object_uid.clone()
-                            .or_else(|| state.current_object_id.clone())
+                        // Use the context stack to get the current object's UID or ID
+                        let parent_uid = state.current_object_uid()
+                            .or_else(|| state.current_object_id())
                             .unwrap_or_else(|| "unknown".to_string());
                         tracing::info!("Found media file: {} (Media UID: {})", text, parent_uid);
                         state.media_file_paths.insert(parent_uid, PathBuf::from(text.clone()));
@@ -380,15 +414,18 @@ impl ProjectParser {
                     // Use just the current tag name as the key (not full path) for easier lookup
                     let child_key = current_tag.to_string();
 
-                    if let Some(ref obj_uid) = state.current_object_uid {
-                        if let Some(obj) = state.objects_by_uid.get_mut(obj_uid) {
+                    // Use context stack to find the current object and store text in it
+                    if let Some(obj_uid) = state.current_object_uid() {
+                        if let Some(obj) = state.objects_by_uid.get_mut(&obj_uid) {
                             if !state.current_text.is_empty() {
                                 obj.children.entry(child_key.clone()).or_default().push(state.current_text.clone());
                             }
                         }
-                    } else if let Some(ref obj_id) = state.current_object_id {
+                    }
+                    // Also try ID-based lookup (some objects only have ObjectID)
+                    if let Some(obj_id) = state.current_object_id() {
                         // Store in the LAST (most recent) object with this ID
-                        if let Some(objs) = state.objects_by_id.get_mut(obj_id) {
+                        if let Some(objs) = state.objects_by_id.get_mut(&obj_id) {
                             if let Some(obj) = objs.last_mut() {
                                 if !state.current_text.is_empty() {
                                     obj.children.entry(child_key).or_default().push(state.current_text.clone());
@@ -473,15 +510,9 @@ impl ProjectParser {
             match key.as_str() {
                 "ObjectID" => {
                     this_object_id = Some(value.clone());
-                    if !is_empty {
-                        state.current_object_id = Some(value.clone());
-                    }
                 }
                 "ObjectUID" => {
                     this_object_uid = Some(value.clone());
-                    if !is_empty {
-                        state.current_object_uid = Some(value.clone());
-                    }
                 }
                 "ObjectRef" => {
                     object_ref = Some(value.clone());
@@ -491,6 +522,12 @@ impl ProjectParser {
                 }
                 _ => {}
             }
+        }
+
+        // Push context for non-empty elements (empty elements don't create a new context level)
+        // This is CRITICAL: each Start element gets a context entry that will be popped on End
+        if !is_empty {
+            state.object_context_stack.push((this_object_id.clone(), this_object_uid.clone()));
         }
 
         // Create object if it has an ID or UID
@@ -514,40 +551,58 @@ impl ProjectParser {
             }
         }
 
-        // Store references - associate with the current parent context
+        // Store references - associate with the current parent context (BEFORE this element)
         // References go FROM the current context TO the target
+        // IMPORTANT: For references, we need the context BEFORE this element was pushed
         let has_ref = object_ref.is_some() || object_uref.is_some();
         if has_ref {
-            // Determine the source (current parent)
-            // Prefer UID context, fall back to ID context
-            let source_uid = state.current_object_uid.clone();
-            let source_id = state.current_object_id.clone();
+            // Get the context from BEFORE this element (the parent)
+            // If this is non-empty, we just pushed ourselves, so look at the second-to-last
+            // If this is empty, we didn't push, so look at the last
+            let parent_context = if !is_empty && state.object_context_stack.len() >= 2 {
+                // Look at context before we pushed ourselves
+                let idx = state.object_context_stack.len() - 2;
+                // Find the nearest ancestor with an ID or UID
+                state.object_context_stack[..=idx].iter().rev()
+                    .find(|(id, uid)| id.is_some() || uid.is_some())
+                    .cloned()
+            } else if is_empty && !state.object_context_stack.is_empty() {
+                // Empty element - look at current context
+                state.object_context_stack.iter().rev()
+                    .find(|(id, uid)| id.is_some() || uid.is_some())
+                    .cloned()
+            } else {
+                None
+            };
+
+            let (source_id, source_uid) = parent_context.unwrap_or((None, None));
 
             if let Some(ref target) = object_ref {
                 // ObjectRef targets a numeric ObjectID
-                if let Some(ref src_uid) = source_uid {
-                    state.refs_from_uid.entry(src_uid.clone()).or_default()
-                        .push((tag_name.to_string(), target.clone(), false));
-                } else if let Some(ref src_id) = source_id {
+                // Store under the parent's ID - prefer ID over UID for clip items
+                if let Some(ref src_id) = source_id {
                     state.refs_from_id.entry(src_id.clone()).or_default()
+                        .push((tag_name.to_string(), target.clone(), false));
+                } else if let Some(ref src_uid) = source_uid {
+                    state.refs_from_uid.entry(src_uid.clone()).or_default()
                         .push((tag_name.to_string(), target.clone(), false));
                 }
                 tracing::debug!("Ref: {} --{}-> {} (numeric)",
-                    source_uid.as_ref().or(source_id.as_ref()).unwrap_or(&"?".to_string()),
+                    source_id.as_ref().or(source_uid.as_ref()).unwrap_or(&"?".to_string()),
                     tag_name, target);
             }
 
             if let Some(ref target) = object_uref {
                 // ObjectURef targets a GUID ObjectUID
-                if let Some(ref src_uid) = source_uid {
-                    state.refs_from_uid.entry(src_uid.clone()).or_default()
-                        .push((tag_name.to_string(), target.clone(), true));
-                } else if let Some(ref src_id) = source_id {
+                if let Some(ref src_id) = source_id {
                     state.refs_from_id.entry(src_id.clone()).or_default()
+                        .push((tag_name.to_string(), target.clone(), true));
+                } else if let Some(ref src_uid) = source_uid {
+                    state.refs_from_uid.entry(src_uid.clone()).or_default()
                         .push((tag_name.to_string(), target.clone(), true));
                 }
                 tracing::debug!("Ref: {} --{}-> {} (GUID)",
-                    source_uid.as_ref().or(source_id.as_ref()).unwrap_or(&"?".to_string()),
+                    source_id.as_ref().or(source_uid.as_ref()).unwrap_or(&"?".to_string()),
                     tag_name, target);
             }
         }
@@ -758,14 +813,28 @@ impl ProjectParser {
             .cloned()
             .unwrap_or_else(|| format!("Sequence {}", id));
 
+        // Extract duration from MZ.OutPoint (in ticks)
+        // 254016000000 ticks per second
+        const TICKS_PER_SECOND: i64 = 254016000000;
+        let duration_ticks = obj.children.get("MZ.OutPoint")
+            .and_then(|v| v.first())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        let duration_seconds = if duration_ticks > 0 {
+            duration_ticks as f64 / TICKS_PER_SECOND as f64
+        } else {
+            0.0
+        };
+
         // Log what we found for debugging
-        tracing::debug!("Sequence {} name: '{}', children keys: {:?}",
-            id, name, obj.children.keys().collect::<Vec<_>>());
+        tracing::info!("Sequence '{}' ({}): MZ.OutPoint={}, duration={:.1}s, children: {:?}",
+            name, id, duration_ticks, duration_seconds, obj.children.keys().collect::<Vec<_>>());
 
         Some(Sequence {
             object_id: id.to_string(),
             name,
-            duration_ticks: 0,
+            duration_ticks,
             frame_rate: FrameRate {
                 numerator: 24000,
                 denominator: 1001,

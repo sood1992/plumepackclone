@@ -1,0 +1,15 @@
+[package]
+name = "parser-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "parser-test"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+flate2 = "1.0"
+quick-xml = "0.37"
+tracing = "0.1"
+tracing-subscriber = "0.3"
