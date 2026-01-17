@@ -885,16 +885,16 @@ impl ProjectParser {
                             clip_id, state, end_ticks - start_ticks
                         );
 
-                        // Log the first few clips for debugging
-                        if found_video + found_audio < 3 {
+                        // Log the first few clips for debugging (use WARN to ensure visibility)
+                        if found_video + found_audio < 5 {
                             const TICKS_PER_SEC: f64 = 254016000000.0;
-                            tracing::debug!(
-                                "Clip {}: timeline={:.2}s-{:.2}s, source in={:.2}s out={:.2}s",
+                            let duration_sec = (out_point_ticks - in_point_ticks) as f64 / TICKS_PER_SEC;
+                            tracing::warn!(
+                                "Clip {}: source in={:.3}s out={:.3}s duration={:.3}s",
                                 clip_id,
-                                start_ticks as f64 / TICKS_PER_SEC,
-                                end_ticks as f64 / TICKS_PER_SEC,
                                 in_point_ticks as f64 / TICKS_PER_SEC,
                                 out_point_ticks as f64 / TICKS_PER_SEC,
+                                duration_sec,
                             );
                         }
 
@@ -1028,6 +1028,10 @@ impl ProjectParser {
         state: &ParserState,
         timeline_duration: i64,
     ) -> (i64, i64) {
+        // Maximum reasonable InPoint: 24 hours in ticks
+        // If InPoint is larger than this, it's probably not a real source media time
+        const MAX_REASONABLE_TICKS: i64 = 254016000000 * 86400; // 24 hours
+
         // Follow: TrackItem -> SubClip ref -> Clip ref -> InPoint/OutPoint
         if let Some(refs) = state.refs_from_id.get(track_item_id) {
             for (ref_tag, target_id, _is_guid) in refs {
@@ -1039,6 +1043,22 @@ impl ProjectParser {
                                 // Found Clip reference, get InPoint/OutPoint from it
                                 if let Some(clip_objs) = state.objects_by_id.get(clip_id) {
                                     for clip_obj in clip_objs {
+                                        // Skip synthetic/adjustment clips - they don't have real source media
+                                        let is_synthetic = clip_obj.children.contains_key("AdjustmentLayer")
+                                            || clip_obj.children.contains_key("SyntheticMedia")
+                                            || clip_obj.children.keys().any(|k| k.contains("SyntheticMedia"));
+
+                                        if is_synthetic {
+                                            tracing::debug!(
+                                                "Clip {} is synthetic/adjustment layer, using timeline duration",
+                                                clip_id
+                                            );
+                                            if timeline_duration > 0 {
+                                                return (0, timeline_duration);
+                                            }
+                                            continue;
+                                        }
+
                                         let in_point = clip_obj.children.get("InPoint")
                                             .and_then(|v| v.first())
                                             .and_then(|s| s.parse::<i64>().ok())
@@ -1047,6 +1067,19 @@ impl ProjectParser {
                                             .and_then(|v| v.first())
                                             .and_then(|s| s.parse::<i64>().ok())
                                             .unwrap_or(0);
+
+                                        // Sanity check: if InPoint is unreasonably large (> 24 hours),
+                                        // this might be a composition clip, not source media
+                                        if in_point > MAX_REASONABLE_TICKS {
+                                            tracing::debug!(
+                                                "Clip {} has unreasonable InPoint {}, using timeline duration",
+                                                clip_id, in_point
+                                            );
+                                            if timeline_duration > 0 {
+                                                return (0, timeline_duration);
+                                            }
+                                            continue;
+                                        }
 
                                         if out_point > in_point {
                                             return (in_point, out_point);
