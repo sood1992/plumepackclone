@@ -429,15 +429,15 @@ impl FFmpeg {
     ) -> Result<()> {
         let duration = end_seconds - start_seconds;
 
+        // Use OUTPUT seeking (ss after -i) for more reliable stream copy
+        // Input seeking can cause corrupted output when not landing on keyframes
         let mut cmd = Command::new(&self.ffmpeg_path);
-        cmd.args([
-            "-y",
-            "-ss",
-            &format!("{:.6}", start_seconds),
-            "-i",
-        ])
+        cmd.args(["-y", "-i"])
         .arg(input)
         .args([
+            // Output seeking - more accurate with stream copy
+            "-ss",
+            &format!("{:.6}", start_seconds),
             "-t",
             &format!("{:.6}", duration),
             "-c",
@@ -448,9 +448,12 @@ impl FFmpeg {
             "0:v?",    // Map all video streams (? = optional if none exist)
             "-map",
             "0:a?",    // Map all audio streams (? = optional if none exist)
-            // Avoid negative timestamps
+            // Avoid negative timestamps and fix timestamp issues
             "-avoid_negative_ts",
             "make_zero",
+            // Reset timestamps so output starts at 0
+            "-reset_timestamps",
+            "1",
         ])
         .arg(output)
         .stdout(Stdio::piped())
